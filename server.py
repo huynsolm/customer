@@ -11,6 +11,12 @@ import summary
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.environ.get("CAFE_DB") or os.path.join(HERE, "cafe.db")
 PORT = int(os.environ.get("PORT", "8000"))
+MAX_BODY = 64 * 1024  # 이 앱의 요청 본문은 수백 바이트면 충분하다
+STATIC = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/client.js": ("client.js", "text/javascript; charset=utf-8"),
+}
 SEED = [("우유", "개", 5, 3), ("원두", "kg", 2, 4), ("컵(12oz)", "개", 50, 120),
         ("시럽(바닐라)", "병", 1, 2), ("빨대", "봉", 2, 6)]
 
@@ -55,6 +61,8 @@ def route(conn, method, path, body):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 10  # 소켓 읽기 제한 시간(초). 본문이 다 오지 않아도 스레드가 계속 붙잡혀 있지 않게 한다.
+
     def _send(self, code, payload, ctype="application/json; charset=utf-8"):
         data = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(code)
@@ -64,12 +72,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle(self, method):
-        if method == "GET" and self.path in ("/", "/index.html"):
-            with open(os.path.join(HERE, "index.html"), "rb") as f:
-                return self._send(200, f.read(), "text/html; charset=utf-8")
+        static = STATIC.get(self.path) if method == "GET" else None
+        if static:
+            name, ctype = static
+            with open(os.path.join(HERE, name), "rb") as f:
+                return self._send(200, f.read(), ctype)
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(n) or b"{}")
+            if n < 0 or n > MAX_BODY:
+                self.close_connection = True  # 읽지 않은 본문이 다음 요청으로 해석되지 않게 연결을 닫는다
+                if n < 0:
+                    raise inv.InventoryError("Content-Length가 올바르지 않습니다")
+                return self._send(413, {"error": "요청 본문이 너무 큽니다"})
+            raw = self.rfile.read(n)  # 다 오지 않으면 Handler.timeout 뒤 TimeoutError
+            if len(raw) != n:
+                raise inv.InventoryError("요청 본문이 Content-Length보다 짧습니다")
+            body = json.loads(raw or b"{}")
             if not isinstance(body, dict):
                 raise inv.InventoryError("요청 본문은 JSON 객체여야 합니다")
             conn = inv.connect(DB)
@@ -81,6 +99,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": str(e)})
         except (KeyError, ValueError, IndexError, TypeError, OverflowError):
             self._send(400, {"error": "잘못된 요청입니다"})
+        except TimeoutError:
+            self.close_connection = True
+            self._send(408, {"error": "요청 본문을 제한 시간 안에 받지 못했습니다"})
         except sqlite3.Error:
             self._send(500, {"error": "저장 중 오류가 발생했습니다. 다시 시도해 주세요"})
         except Exception:  # noqa: BLE001 — 응답 없이 연결이 끊기지 않도록 마지막에 JSON으로 답한다

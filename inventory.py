@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS stock_movements (
   note TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
+CREATE INDEX IF NOT EXISTS idx_movements_item ON stock_movements(item_id);
+CREATE INDEX IF NOT EXISTS idx_movements_po ON stock_movements(po_id);
+CREATE INDEX IF NOT EXISTS idx_movements_corrects ON stock_movements(corrects_id);
+CREATE INDEX IF NOT EXISTS idx_movements_kind_time ON stock_movements(kind, created_at);
 """
 
 
@@ -117,10 +121,24 @@ def _request(**kw):
     return json.dumps(kw, sort_keys=True, ensure_ascii=False)
 
 
+def _legacy_request(row):
+    """request 없이 남은 이전 버전 기록에서 원래 요청을 복원한다. 복원할 수 없으면 None."""
+    if row["kind"] == "receipt":
+        return _request(op="receive", po_id=row["po_id"], qty=row["delta"])
+    if row["kind"] in ("use", "waste"):
+        return _request(op=row["kind"], item_id=row["item_id"], qty=-row["delta"])
+    return None  # 기초 재고·실사·정정은 처음 받은 값(실사 수량, 정정 수량·사유)을 알 수 없다
+
+
 def _replay(conn, key, request):
     """같은 키의 기록이 있으면 돌려준다. 키는 같은데 내용이 다르면 조용히 넘기지 않고 거부한다."""
     done = conn.execute("SELECT * FROM stock_movements WHERE idempotency_key=?", (key,)).fetchone()
-    if done and done["request"] is not None and done["request"] != request:
+    if not done:
+        return None
+    stored = done["request"] if done["request"] is not None else _legacy_request(done)
+    if stored is None:
+        raise InventoryError("이 요청 키는 이전 기록에 쓰였고 그 내용을 확인할 수 없어 다시 쓸 수 없습니다")
+    if stored != request:
         raise InventoryError("같은 요청 키로 다른 내용이 이미 기록되어 있습니다")
     return done
 
@@ -170,8 +188,8 @@ def add_item(conn, name, unit, reorder_point=0, opening=0, key=None):
             "INSERT INTO items(name,unit,reorder_point) VALUES(?,?,?)", (name, unit, reorder_point)
         ).lastrowid
         if opening:
-            _insert(conn, item_id=item_id, kind="opening", delta=opening,
-                    key=key or "opening-%d" % item_id, note="기초 재고")
+            _insert(conn, item_id=item_id, kind="opening", delta=opening, key=key or "opening-%d" % item_id,
+                    request=_request(op="opening", item_id=item_id, qty=opening), note="기초 재고")
     return item_id
 
 
@@ -214,6 +232,17 @@ def current_stock(conn, item_id):
 USAGE_DAYS = 7   # 최근 며칠의 사용량으로 하루 평균을 낼지
 COVER_DAYS = 7   # 권장 발주량이 버티게 할 일수 (가정: "일주일 쓸 만큼")
 
+# 품목별 최근 사용·폐기량. 기간은 원래 기록의 시각으로 고르고, 그 기록의 정정(조회 시점까지)을 더한다.
+# 정정 합계를 먼저 한 번 묶어 두고 조인한다(기록마다 정정을 다시 찾으면 기록 수의 제곱만큼 느려진다).
+# 매개변수: (조회 시각, 기간 시작, 조회 시각)
+USAGE_SQL = (
+    "SELECT m.item_id, SUM(-(m.delta + COALESCE(c.fix, 0))) FROM stock_movements m"
+    " LEFT JOIN (SELECT corrects_id, SUM(delta) AS fix FROM stock_movements"
+    "   WHERE corrects_id IS NOT NULL AND created_at<=? GROUP BY corrects_id) c ON c.corrects_id=m.id"
+    " WHERE m.kind IN ('use','waste') AND m.created_at>=? AND m.created_at<=?"
+    " GROUP BY m.item_id"
+)
+
 
 def shortage_report(conn, now=None):
     """부족 품목과 권장 발주량. 숫자는 모두 여기서 계산하고, AI는 이 결과를 문장으로만 바꾼다."""
@@ -222,12 +251,7 @@ def shortage_report(conn, now=None):
         since = conn.execute("SELECT datetime(?, ?)", (now, "-%d days" % USAGE_DAYS)).fetchone()[0]
         pos = list_pos(conn)
         items = list_items(conn)
-        # 기간은 원래 사용·폐기 기록의 시각으로 고르고, 그 기록의 정정(조회 시점까지)을 더한다.
-        used_by_item = dict(conn.execute(
-            "SELECT m.item_id, SUM(-(m.delta + COALESCE((SELECT SUM(c.delta) FROM stock_movements c"
-            "   WHERE c.corrects_id=m.id AND c.created_at<=?), 0)))"
-            " FROM stock_movements m WHERE m.kind IN ('use','waste') AND m.created_at>=? AND m.created_at<=?"
-            " GROUP BY m.item_id", (now, since, now)).fetchall())
+        used_by_item = dict(conn.execute(USAGE_SQL, (now, since, now)).fetchall())
     rows = []
     for it in items:
         used = max(used_by_item.get(it["id"], 0), 0)

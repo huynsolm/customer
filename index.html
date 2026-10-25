@@ -36,6 +36,8 @@
     <button data-v="hist">변동 이력</button>
   </nav>
   <div id="err" role="alert"></div>
+  <div id="pending" class="panel" hidden>결과를 확인하지 못한 요청 <b id="pendingN"></b>건이 있습니다.
+    <button id="resend">같은 내용으로 다시 보내기</button> <span class="mut">이미 반영된 요청은 중복으로 반영되지 않습니다.</span></div>
   <section id="view"></section>
 </main>
 <script>
@@ -50,8 +52,38 @@ async function api(path, body) {
   if (!r.ok) throw new Error(j.error);
   return j;
 }
+
+// 결과를 모르는 요청(응답 유실·서버 오류)은 키와 본문을 sessionStorage에 남긴다. 새로고침하거나
+// 화면을 옮긴 뒤 같은 내용을 다시 보내도 같은 키를 쓰므로 서버가 한 번만 반영한다.
+// 같은 요청이 처리 중일 때 다시 누르는 경우(더블클릭)도 같은 키를 쓴다.
+const PENDING = 'pendingRequests';
+function loadPending() { try { return JSON.parse(sessionStorage.getItem(PENDING)) || {}; } catch { return {}; } }
+function savePending(p) { try { sessionStorage.setItem(PENDING, JSON.stringify(p)); } catch {} }
+async function send(path, body) {
+  const sig = path + ' ' + JSON.stringify(body);
+  const p = loadPending();
+  const key = p[sig]?.key || uid();
+  p[sig] = {path, body, key}; savePending(p);
+  let r;
+  try { r = await fetch(path, {method:'POST', body:JSON.stringify({...body, key})}); }
+  catch { throw new Error('응답을 받지 못했습니다. 같은 내용으로 다시 누르면 중복 없이 처리됩니다.'); }
+  const j = await r.json().catch(() => ({}));
+  if (r.status < 500) { const q = loadPending(); delete q[sig]; savePending(q); }  // 결과가 확정된 요청만 지운다
+  if (!r.ok) throw new Error(j.error || '요청을 처리하지 못했습니다');
+  return j;
+}
+async function resendPending() {
+  for (const {path, body} of Object.values(loadPending())) await send(path, body);
+}
+
+// 숫자 입력은 전체가 정수일 때만 받는다(parseInt는 1.9→1, 2abc→2로 잘라 버린다).
+function intOf(value, min, label) {
+  const s = String(value ?? '').trim();
+  if (!/^\d+$/.test(s) || +s < min || +s > 1000000) throw new Error(`${label}은 ${min} 이상 1000000 이하의 정수로 입력하세요`);
+  return +s;
+}
+
 const show = e => { $('#err').textContent = e ? e.message : ''; };
-// 중복 클릭 방지: 폼이 열려 있는 동안 같은 key를 재사용한다. 성공하면 다시 그릴 때 새 key가 생긴다.
 async function act(fn) { try { show(); await fn(); await render(); } catch (e) { show(e); } }
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
@@ -66,6 +98,9 @@ function render() {
   return queue = queue.catch(() => {}).then(async () => {
     items = await api('/api/items');
     await ({stock: vStock, po: vPo, hist: vHist})[view]();
+    const n = Object.keys(loadPending()).length;
+    $('#pending').hidden = !n;
+    $('#pendingN').textContent = n;
   });
 }
 
@@ -93,41 +128,47 @@ async function vStock() {
   </table></div>
   <p class="mut">남은 일수·권장 발주는 최근 7일 사용량 기준(가정: 일주일분 + 발주 기준). 사용·폐기·마감은 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
   $('#ai').onclick = async () => {
-    $('#ai').disabled = true; $('#ainote').textContent = '요약 중…';
+    // 응답을 기다리는 동안 화면을 옮기면 이 노드들은 사라진다. 그때 온 응답은 무시한다.
+    const [btn, sum, src, note] = ['#ai', '#sum', '#src', '#ainote'].map(s => $(s));
+    btn.disabled = true; note.textContent = '요약 중…';
     try {
       const r = await api('/api/shortage/ai', {});
-      $('#sum').textContent = r.summary;
-      $('#src').textContent = r.source === 'claude' ? 'Claude' : '계산';
-      $('#ainote').textContent = r.note;
-    } catch (e) { show(e); $('#ainote').textContent = ''; }
-    $('#ai').disabled = false;
+      if (!sum.isConnected) return;
+      sum.textContent = r.summary;
+      src.textContent = r.source === 'claude' ? 'Claude' : '계산';
+      note.textContent = r.note;
+    } catch (e) {
+      if (!sum.isConnected) return;
+      show(e); note.textContent = '';
+    }
+    btn.disabled = false;
   };
   document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
-    const id = +tr.dataset.id, key = tr.dataset.key + b.dataset.a;
-    if (b.dataset.a === 'order') await api('/api/pos', {item_id:id, qty:+b.dataset.q, key});
-    else if (b.dataset.a === 'count') await api('/api/stocktake', {item_id:id, counted:parseInt($('.c', tr).value, 10), key});
-    else await api('/api/out', {item_id:id, qty:parseInt($('.q', tr).value, 10), kind:b.dataset.a, key});
+    const id = +tr.dataset.id;
+    if (b.dataset.a === 'order') await send('/api/pos', {item_id:id, qty:+b.dataset.q});
+    else if (b.dataset.a === 'count') await send('/api/stocktake', {item_id:id, counted:intOf($('.c', tr).value, 0, '실사 수량')});
+    else await send('/api/out', {item_id:id, qty:intOf($('.q', tr).value, 1, '수량'), kind:b.dataset.a});
   })));
 }
 
 async function vPo() {
   const pos = await api('/api/pos');
-  $('#view').innerHTML = `<div class="row" id="newpo" data-key="${uid()}">
+  $('#view').innerHTML = `<div class="row" id="newpo">
       <select id="pi">${itemOptions()}</select>
       <input id="pq" type="number" min="1" placeholder="주문 수량" style="width:110px">
       <button id="pgo">발주 등록</button></div>
     <div class="scroll"><table>
     <tr><th>번호</th><th>품목</th><th class="num">주문</th><th class="num">입고</th><th>상태</th><th>입고 처리</th></tr>
-    ${pos.map(p => `<tr data-id="${p.id}" data-key="${uid()}">
+    ${pos.map(p => `<tr data-id="${p.id}">
       <td>PO-${p.id}</td><td>${esc(p.item_name)}</td><td class="num">${p.ordered_qty}</td>
       <td class="num">${p.received}</td><td><span class="tag">${esc(p.status)}</span></td>
       <td>${p.remaining ? `<input type="number" min="1" class="q" style="width:70px" placeholder="잔량 ${p.remaining}">
         <button data-a="rcv">입고</button> <button data-a="cancel">잔량 취소</button>` : ''}</td></tr>`).join('')}
     </table></div>`;
-  $('#pgo').onclick = () => act(() => api('/api/pos', {item_id:+$('#pi').value, qty:parseInt($('#pq').value, 10), key:$('#newpo').dataset.key}));
+  $('#pgo').onclick = () => act(() => send('/api/pos', {item_id:+$('#pi').value, qty:intOf($('#pq').value, 1, '주문 수량')}));
   document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
     const id = tr.dataset.id;
-    if (b.dataset.a === 'rcv') await api(`/api/pos/${id}/receive`, {qty:parseInt($('.q', tr).value, 10), key:tr.dataset.key});
+    if (b.dataset.a === 'rcv') await send(`/api/pos/${id}/receive`, {qty:intOf($('.q', tr).value, 1, '입고 수량')});
     else {
       const reason = prompt('잔량 취소 사유'); if (reason === null) return;
       await api(`/api/pos/${id}/cancel`, {reason});
@@ -140,7 +181,7 @@ async function vHist() {
   histItem = histItem ?? items[0].id;
   const rows = await api('/api/history/' + histItem);
   let run = 0;
-  const body = rows.map(r => { run += r.delta; return `<tr data-id="${r.id}" data-key="${uid()}">
+  const body = rows.map(r => { run += r.delta; return `<tr data-id="${r.id}">
     <td>${esc(r.created_at)}</td><td>${KIND[r.kind]}</td><td class="num">${r.delta > 0 ? '+' : ''}${r.delta}</td>
     <td class="num">${run}</td><td class="mut">${esc(r.note)}</td>
     <td>${['receipt','use','waste'].includes(r.kind) ? '<button>정정</button>' : ''}</td></tr>`; }).join('');
@@ -151,10 +192,12 @@ async function vHist() {
   document.querySelectorAll('#view tr[data-id] button').forEach(b => b.onclick = () => act(async () => {
     const tr = b.closest('tr');
     const q = prompt('올바른 수량(0 = 취소)'); if (q === null) return;
+    const qty = intOf(q, 0, '정정 수량');
     const reason = prompt('정정 사유'); if (reason === null) return;
-    await api('/api/correct', {movement_id:+tr.dataset.id, qty:parseInt(q, 10), reason, key:tr.dataset.key});
+    await send('/api/correct', {movement_id:+tr.dataset.id, qty, reason});
   }));
 }
+$('#resend').onclick = () => act(resendPending);
 render().catch(show);
 </script>
 </body>

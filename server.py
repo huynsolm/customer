@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import inventory as inv
@@ -69,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(body, dict):
+                raise inv.InventoryError("요청 본문은 JSON 객체여야 합니다")
             conn = inv.connect(DB)
             try:
                 self._send(200, route(conn, method, self.path.split("?")[0], body))
@@ -76,10 +79,13 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
         except inv.InventoryError as e:
             self._send(400, {"error": str(e)})
-        except (KeyError, ValueError, IndexError, TypeError):
+        except (KeyError, ValueError, IndexError, TypeError, OverflowError):
             self._send(400, {"error": "잘못된 요청입니다"})
         except sqlite3.Error:
             self._send(500, {"error": "저장 중 오류가 발생했습니다. 다시 시도해 주세요"})
+        except Exception:  # noqa: BLE001 — 응답 없이 연결이 끊기지 않도록 마지막에 JSON으로 답한다
+            self.log_error("처리되지 않은 오류:\n%s", traceback.format_exc())
+            self._send(500, {"error": "서버 오류가 발생했습니다"})
 
     def do_GET(self):
         self._handle("GET")

@@ -47,21 +47,35 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary.template_summary(ROWS), "부족 품목 1개: 우유 27개 주문 권장(현재 4개, 약 1.1일 분).")
         self.assertEqual(summary.template_summary(ROWS[1:]), "발주 기준 이하인 품목이 없습니다.")
 
-    def test_uses_claude_text_when_numbers_grounded(self):
-        client, create = client_returning("우유가 4개 남아 약 1.1일 분입니다. 27개 주문을 권장합니다.")
+    def test_server_fills_numbers_and_units(self):
+        client, create = client_returning("[[1.suggested_qty]] 주문이 가장 급합니다([[1.days_left]]).")
         text, source, _ = summary.ai_summary(ROWS, client)
-        self.assertEqual(source, "claude")
-        self.assertIn("27개", text)
+        self.assertEqual((text, source), ("우유 27개 주문이 가장 급합니다(우유 약 1.1일 분).", "claude"))
         kw = create.call_args.kwargs
         self.assertEqual(kw["model"], "claude-opus-5-5")
         self.assertEqual(kw["fallbacks"], "default")
 
-    def test_rejects_invented_numbers(self):
-        client, _ = client_returning("우유 30개를 주문하세요.")
-        text, source, note = summary.ai_summary(ROWS, client)
-        self.assertEqual(source, "template")
-        self.assertIn("27개", text)
-        self.assertIn("숫자", note)
+    def test_rejects_numbers_written_by_model(self):
+        """2차 검수 #6: 전에는 아래 응답이 모두 통과했다."""
+        for bad in ["우유 1~2일 분입니다. [[1.suggested_qty]]",
+                    "우유 1,000개 주문 권장 [[1.suggested_qty]]",
+                    "우유 백 개 주문 권장 [[1.suggested_qty]]",
+                    "[[1.suggested_qty]] 그리고 두 병 더",
+                    "우유 27kg 주문 권장",
+                    "우유 -27개 주문 권장",
+                    "[[9.suggested_qty]] 주문",                      # 없는 품목
+                    "[[2.days_left]] [[1.suggested_qty]]",           # 값이 없는 필드
+                    "[[1.price]] [[1.suggested_qty]]",               # 없는 필드
+                    "원두가 조금 부족합니다."]:                       # 부족 품목 권장량 누락
+            client, _ = client_returning(bad)
+            text, source, note = summary.ai_summary(ROWS, client)
+            self.assertEqual(source, "template", bad)
+            self.assertEqual(text, summary.template_summary(ROWS))
+
+    def test_no_shortage_skips_claude(self):
+        client, create = client_returning("x")
+        self.assertEqual(summary.ai_summary(ROWS[1:], client)[1], "template")
+        create.assert_not_called()
 
     def test_refusal_falls_back(self):
         client, _ = client_returning("", stop_reason="refusal")

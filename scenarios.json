@@ -1,0 +1,43 @@
+[
+  {
+    "name": "사례 1. 정상 입고 — 원두가 기준 이하로 떨어져 발주, 주문 수량 그대로 도착",
+    "items": [{"name": "원두", "unit": "kg", "reorder_point": 2, "opening": 2}],
+    "steps": [
+      {"op": "check", "item": "원두", "stock": 2, "low": true},
+      {"op": "create_po", "item": "원두", "qty": 5, "key": "po-1", "as": "PO"},
+      {"op": "check", "po": "PO", "status": "발주됨"},
+      {"op": "receive", "po": "PO", "qty": 5, "key": "rcv-1"},
+      {"op": "check", "item": "원두", "stock": 7, "low": false, "po": "PO", "status": "입고 완료"}
+    ]
+  },
+  {
+    "name": "사례 2. 부분 입고 — 우유 10개 주문, 8개 도착, 잔량은 거래처 결품으로 취소",
+    "items": [{"name": "우유", "unit": "개", "reorder_point": 5, "opening": 3}],
+    "steps": [
+      {"op": "create_po", "item": "우유", "qty": 10, "key": "po-1", "as": "PO"},
+      {"op": "create_po", "item": "우유", "qty": 10, "key": "po-1", "note": "발주 버튼 더블클릭"},
+      {"op": "check", "po_count": 1},
+      {"op": "receive", "po": "PO", "qty": 8, "key": "rcv-1"},
+      {"op": "receive", "po": "PO", "qty": 8, "key": "rcv-1", "note": "입고 버튼 더블클릭"},
+      {"op": "check", "item": "우유", "stock": 11, "po": "PO", "status": "부분 입고"},
+      {"op": "receive", "po": "PO", "qty": 5, "key": "rcv-2", "error": "초과"},
+      {"op": "cancel_remaining", "po": "PO", "reason": "거래처 결품"},
+      {"op": "check", "item": "우유", "stock": 11, "po": "PO", "status": "종결(미입고 2)"}
+    ]
+  },
+  {
+    "name": "사례 3. 잘못된 수량 정정 — 컵 80개 도착인데 100으로 입력, 마감 실사에서 발견",
+    "items": [{"name": "컵(12oz)", "unit": "개", "reorder_point": 50, "opening": 40}],
+    "steps": [
+      {"op": "create_po", "item": "컵(12oz)", "qty": 100, "key": "po-1", "as": "PO"},
+      {"op": "receive", "po": "PO", "qty": 100, "key": "rcv-1", "as": "RCV", "note": "실제는 80개"},
+      {"op": "record_out", "item": "컵(12oz)", "qty": 30, "kind": "use", "key": "use-1"},
+      {"op": "check", "item": "컵(12oz)", "stock": 110, "note": "장부상 110, 실제 90"},
+      {"op": "correct", "movement": "RCV", "qty": 80, "key": "fix-1", "reason": "입고 시 100으로 잘못 입력(실제 80)"},
+      {"op": "check", "item": "컵(12oz)", "stock": 90, "po": "PO", "status": "부분 입고"},
+      {"op": "cancel_remaining", "po": "PO", "reason": "20개는 다음 발주에 포함"},
+      {"op": "stocktake", "item": "컵(12oz)", "counted": 90, "key": "close-1"},
+      {"op": "check", "item": "컵(12oz)", "stock": 90, "history_kinds": ["opening", "receipt", "use", "correction", "adjustment"], "last_delta": 0}
+    ]
+  }
+]

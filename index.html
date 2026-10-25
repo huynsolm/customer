@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>카페 재고</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --mut:#6b6b70; --line:#e2e2e6; --acc:#2a6df4; --bad:#c62828; --warn:#fff3e0; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16161a; --fg:#ececf0; --mut:#9a9aa3; --line:#34343b; --acc:#6c9bff; --bad:#ff6b6b; --warn:#3a2d17; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:16px; }
+  nav { display:flex; gap:8px; margin-bottom:16px; }
+  nav button.on { background:var(--acc); color:#fff; border-color:var(--acc); }
+  button, input, select { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  button { cursor:pointer; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:500; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .low { background:var(--warn); }
+  .mut { color:var(--mut); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:12px 0; }
+  #err { color:var(--bad); min-height:1.5em; }
+  .tag { font-size:12px; padding:2px 8px; border:1px solid var(--line); border-radius:99px; }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>카페 재고</h1>
+  <nav>
+    <button data-v="stock" class="on">재고 목록</button>
+    <button data-v="po">발주·입고</button>
+    <button data-v="hist">변동 이력</button>
+  </nav>
+  <div id="err" role="alert"></div>
+  <section id="view"></section>
+</main>
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const uid = () => crypto.randomUUID();
+let view = 'stock', histItem = null, items = [];
+
+async function api(path, body) {
+  const r = await fetch(path, body ? {method:'POST', body:JSON.stringify(body)} : {});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error);
+  return j;
+}
+const show = e => { $('#err').textContent = e ? e.message : ''; };
+// 중복 클릭 방지: 폼이 열려 있는 동안 같은 key를 재사용한다. 성공하면 다시 그릴 때 새 key가 생긴다.
+async function act(fn) { try { show(); await fn(); await render(); } catch (e) { show(e); } }
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  view = b.dataset.v;
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  show(); render().catch(show);
+});
+
+// 더블클릭 등으로 다시 그리기가 겹치면 화면이 비거나 옛 데이터로 덮일 수 있어 순서대로 실행한다.
+let queue = Promise.resolve();
+function render() {
+  return queue = queue.catch(() => {}).then(async () => {
+    items = await api('/api/items');
+    await ({stock: vStock, po: vPo, hist: vHist})[view]();
+  });
+}
+
+function itemOptions(sel) {
+  return items.map(i => `<option value="${i.id}" ${i.id == sel ? 'selected' : ''}>${esc(i.name)}</option>`).join('');
+}
+
+async function vStock() {
+  $('#view').innerHTML = `<div class="scroll"><table>
+    <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th>사용·폐기 / 마감</th><th></th></tr>
+    ${items.map(i => `<tr class="${i.low ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
+      <td>${esc(i.name)} ${i.low ? '<span class="tag">부족</span>' : ''}</td>
+      <td class="num">${i.stock} ${esc(i.unit)}</td><td class="num">${i.reorder_point}</td>
+      <td><input type="number" min="1" class="q" style="width:70px" aria-label="${esc(i.name)} 수량">
+        <button data-a="use">사용</button> <button data-a="waste">폐기</button></td>
+      <td><input type="number" min="0" class="c" style="width:70px" aria-label="${esc(i.name)} 실사 수량">
+        <button data-a="count">마감</button></td></tr>`).join('')}
+  </table></div>
+  <p class="mut">사용·폐기·마감 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
+  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
+    const id = +tr.dataset.id, key = tr.dataset.key + b.dataset.a;
+    if (b.dataset.a === 'count') await api('/api/stocktake', {item_id:id, counted:parseInt($('.c', tr).value, 10), key});
+    else await api('/api/out', {item_id:id, qty:parseInt($('.q', tr).value, 10), kind:b.dataset.a, key});
+  })));
+}
+
+async function vPo() {
+  const pos = await api('/api/pos');
+  $('#view').innerHTML = `<div class="row" id="newpo" data-key="${uid()}">
+      <select id="pi">${itemOptions()}</select>
+      <input id="pq" type="number" min="1" placeholder="주문 수량" style="width:110px">
+      <button id="pgo">발주 등록</button></div>
+    <div class="scroll"><table>
+    <tr><th>번호</th><th>품목</th><th class="num">주문</th><th class="num">입고</th><th>상태</th><th>입고 처리</th></tr>
+    ${pos.map(p => `<tr data-id="${p.id}" data-key="${uid()}">
+      <td>PO-${p.id}</td><td>${esc(p.item_name)}</td><td class="num">${p.ordered_qty}</td>
+      <td class="num">${p.received}</td><td><span class="tag">${esc(p.status)}</span></td>
+      <td>${p.remaining ? `<input type="number" min="1" class="q" style="width:70px" placeholder="잔량 ${p.remaining}">
+        <button data-a="rcv">입고</button> <button data-a="cancel">잔량 취소</button>` : ''}</td></tr>`).join('')}
+    </table></div>`;
+  $('#pgo').onclick = () => act(() => api('/api/pos', {item_id:+$('#pi').value, qty:parseInt($('#pq').value, 10), key:$('#newpo').dataset.key}));
+  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
+    const id = tr.dataset.id;
+    if (b.dataset.a === 'rcv') await api(`/api/pos/${id}/receive`, {qty:parseInt($('.q', tr).value, 10), key:tr.dataset.key});
+    else {
+      const reason = prompt('잔량 취소 사유'); if (reason === null) return;
+      await api(`/api/pos/${id}/cancel`, {reason});
+    }
+  })));
+}
+
+const KIND = {opening:'기초 재고', receipt:'입고', use:'사용', waste:'폐기', correction:'정정', adjustment:'마감 조정'};
+async function vHist() {
+  histItem = histItem ?? items[0].id;
+  const rows = await api('/api/history/' + histItem);
+  let run = 0;
+  const body = rows.map(r => { run += r.delta; return `<tr data-id="${r.id}" data-key="${uid()}">
+    <td>${esc(r.created_at)}</td><td>${KIND[r.kind]}</td><td class="num">${r.delta > 0 ? '+' : ''}${r.delta}</td>
+    <td class="num">${run}</td><td class="mut">${esc(r.note)}</td>
+    <td>${['receipt','use','waste'].includes(r.kind) ? '<button>정정</button>' : ''}</td></tr>`; }).join('');
+  $('#view').innerHTML = `<div class="row"><select id="hi">${itemOptions(histItem)}</select></div>
+    <div class="scroll"><table><tr><th>시각</th><th>구분</th><th class="num">변동</th><th class="num">누계</th><th>비고</th><th></th></tr>${body}</table></div>
+    <p class="mut">기록은 삭제하지 않습니다. 정정하면 차이만큼의 정정 기록이 추가됩니다(0 입력 = 취소).</p>`;
+  $('#hi').onchange = e => { histItem = +e.target.value; render(); };
+  document.querySelectorAll('#view tr[data-id] button').forEach(b => b.onclick = () => act(async () => {
+    const tr = b.closest('tr');
+    const q = prompt('올바른 수량(0 = 취소)'); if (q === null) return;
+    const reason = prompt('정정 사유'); if (reason === null) return;
+    await api('/api/correct', {movement_id:+tr.dataset.id, qty:parseInt(q, 10), reason, key:tr.dataset.key});
+  }));
+}
+render().catch(show);
+</script>
+</body>
+</html>

@@ -5,6 +5,7 @@ import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import inventory as inv
+import summary
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.environ.get("CAFE_DB") or os.path.join(HERE, "cafe.db")
@@ -29,8 +30,14 @@ def route(conn, method, path, body):
             return inv.list_pos(conn)
         if parts[:2] == ["api", "history"]:
             return inv.history(conn, int(parts[2]))
+        if parts == ["api", "shortage"]:
+            rows = inv.shortage_report(conn)
+            return {"rows": rows, "summary": summary.template_summary(rows)}
     elif method == "POST":
         a = body.get("actor", "")
+        if parts == ["api", "shortage", "ai"]:
+            text, source, note = summary.ai_summary(inv.shortage_report(conn))
+            return {"summary": text, "source": source, "note": note}
         if parts == ["api", "pos"]:
             return {"id": inv.create_po(conn, body["item_id"], body["qty"], body.get("key"))}
         if parts[:2] == ["api", "pos"] and parts[3] == "receive":

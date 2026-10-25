@@ -1,4 +1,5 @@
 """카페 재고 핵심 로직. 재고는 append-only 변동 이력(stock_movements)의 합계로 계산한다."""
+import math
 import sqlite3
 
 SCHEMA = """
@@ -169,6 +170,38 @@ def history(conn, item_id):
 
 def current_stock(conn, item_id):
     return _stock(conn, item_id)
+
+
+USAGE_DAYS = 7   # 최근 며칠의 사용량으로 하루 평균을 낼지
+COVER_DAYS = 7   # 권장 발주량이 버티게 할 일수 (가정: "일주일 쓸 만큼")
+
+
+def shortage_report(conn, now=None):
+    """부족 품목과 권장 발주량. 숫자는 모두 여기서 계산하고, AI는 이 결과를 문장으로만 바꾼다."""
+    now = now or conn.execute("SELECT datetime('now','localtime')").fetchone()[0]
+    since = conn.execute("SELECT datetime(?, ?)", (now, "-%d days" % USAGE_DAYS)).fetchone()[0]
+    pos = list_pos(conn)
+    rows = []
+    for it in list_items(conn):
+        used = conn.execute(
+            "SELECT COALESCE(SUM(-m.delta),0) FROM stock_movements m"
+            " LEFT JOIN stock_movements o ON o.id=m.corrects_id"
+            " WHERE m.item_id=? AND m.created_at>=? AND m.created_at<=?"
+            " AND (m.kind IN ('use','waste') OR (m.kind='correction' AND o.kind IN ('use','waste')))",
+            (it["id"], since, now)).fetchone()[0]
+        daily = max(used, 0) / USAGE_DAYS
+        incoming = sum(p["remaining"] for p in pos if p["item_id"] == it["id"])
+        available = it["stock"] + incoming
+        target = it["reorder_point"] + math.ceil(daily * COVER_DAYS)
+        rows.append({
+            "item_id": it["id"], "name": it["name"], "unit": it["unit"],
+            "stock": it["stock"], "incoming": incoming, "reorder_point": it["reorder_point"],
+            "daily_use": round(daily, 1),
+            "days_left": round(it["stock"] / daily, 1) if daily else None,
+            "short": available <= it["reorder_point"],
+            "suggested_qty": max(target - available, 0),
+        })
+    return rows
 
 
 # ---------- 발주·입고 ----------

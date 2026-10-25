@@ -23,6 +23,8 @@
   #err { color:var(--bad); min-height:1.5em; }
   .tag { font-size:12px; padding:2px 8px; border:1px solid var(--line); border-radius:99px; }
   .scroll { overflow-x:auto; }
+  .panel { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:16px; }
+  .panel p { margin:8px 0; }
 </style>
 </head>
 <body>
@@ -72,20 +74,38 @@ function itemOptions(sel) {
 }
 
 async function vStock() {
-  $('#view').innerHTML = `<div class="scroll"><table>
-    <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th>사용·폐기 / 마감</th><th></th></tr>
-    ${items.map(i => `<tr class="${i.low ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
-      <td>${esc(i.name)} ${i.low ? '<span class="tag">부족</span>' : ''}</td>
-      <td class="num">${i.stock} ${esc(i.unit)}</td><td class="num">${i.reorder_point}</td>
+  const sh = await api('/api/shortage');
+  const by = Object.fromEntries(sh.rows.map(r => [r.item_id, r]));
+  $('#view').innerHTML = `<div class="panel"><b>부족 품목 요약</b> <span class="tag" id="src">계산</span>
+      <p id="sum">${esc(sh.summary)}</p>
+      <button id="ai">AI로 다시 쓰기</button> <span class="mut" id="ainote"></span></div>
+    <div class="scroll"><table>
+    <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th class="num">남은 일수</th><th class="num">권장 발주</th><th>사용·폐기 / 마감</th><th></th></tr>
+    ${items.map(i => { const r = by[i.id]; return `<tr class="${r.short ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
+      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''}</td>
+      <td class="num">${i.stock} ${esc(i.unit)}${r.incoming ? `<br><span class="mut">+${r.incoming} 입고 예정</span>` : ''}</td><td class="num">${i.reorder_point}</td>
+      <td class="num">${r.days_left ?? '-'}</td>
+      <td class="num">${r.suggested_qty ? `${r.suggested_qty} <button data-a="order" data-q="${r.suggested_qty}">발주</button>` : '-'}</td>
       <td><input type="number" min="1" class="q" style="width:70px" aria-label="${esc(i.name)} 수량">
         <button data-a="use">사용</button> <button data-a="waste">폐기</button></td>
       <td><input type="number" min="0" class="c" style="width:70px" aria-label="${esc(i.name)} 실사 수량">
-        <button data-a="count">마감</button></td></tr>`).join('')}
+        <button data-a="count">마감</button></td></tr>`; }).join('')}
   </table></div>
-  <p class="mut">사용·폐기·마감 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
+  <p class="mut">남은 일수·권장 발주는 최근 7일 사용량 기준(가정: 일주일분 + 발주 기준). 사용·폐기·마감은 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
+  $('#ai').onclick = async () => {
+    $('#ai').disabled = true; $('#ainote').textContent = '요약 중…';
+    try {
+      const r = await api('/api/shortage/ai', {});
+      $('#sum').textContent = r.summary;
+      $('#src').textContent = r.source === 'claude' ? 'Claude' : '계산';
+      $('#ainote').textContent = r.note;
+    } catch (e) { show(e); $('#ainote').textContent = ''; }
+    $('#ai').disabled = false;
+  };
   document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
     const id = +tr.dataset.id, key = tr.dataset.key + b.dataset.a;
-    if (b.dataset.a === 'count') await api('/api/stocktake', {item_id:id, counted:parseInt($('.c', tr).value, 10), key});
+    if (b.dataset.a === 'order') await api('/api/pos', {item_id:id, qty:+b.dataset.q, key});
+    else if (b.dataset.a === 'count') await api('/api/stocktake', {item_id:id, counted:parseInt($('.c', tr).value, 10), key});
     else await api('/api/out', {item_id:id, qty:parseInt($('.q', tr).value, 10), kind:b.dataset.a, key});
   })));
 }

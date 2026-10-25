@@ -205,6 +205,52 @@ class ReviewFindings(unittest.TestCase):
         self.assertEqual(inv.current_stock(conn, milk), 2)
 
 
+class Shortage(unittest.TestCase):
+    NOW = "2026-10-26 20:00:00"
+
+    def setUp(self):
+        self.conn = inv.connect()
+        self.milk = inv.add_item(self.conn, "우유", "개", 5, 30)
+
+    def use(self, qty, key, when):
+        mid = inv.record_out(self.conn, self.milk, qty, "use", key)
+        self.conn.execute("UPDATE stock_movements SET created_at=? WHERE id=?", (when, mid))
+        return mid
+
+    def row(self):
+        return inv.shortage_report(self.conn, now=self.NOW)[0]
+
+    def test_suggestion_from_recent_usage(self):
+        self.use(14, "u1", "2026-10-24 10:00:00")  # 최근 7일 14개 → 하루 2개
+        self.use(9, "u2", "2026-10-10 10:00:00")   # 7일 밖은 제외
+        r = self.row()
+        self.assertEqual((r["stock"], r["daily_use"], r["days_left"]), (7, 2.0, 3.5))
+        self.assertFalse(r["short"])               # 7 > 기준 5
+        self.assertEqual(r["suggested_qty"], 5 + 14 - 7)
+
+    def test_incoming_counts_toward_available(self):
+        self.use(26, "u1", "2026-10-25 10:00:00")  # 재고 4, 하루 26/7
+        r = self.row()
+        self.assertTrue(r["short"])
+        self.assertEqual(r["suggested_qty"], 5 + 26 - 4)
+        po = inv.create_po(self.conn, self.milk, 10)
+        inv.receive(self.conn, po, 4, "r")          # 재고 8, 입고 예정 6
+        r = self.row()
+        self.assertEqual((r["stock"], r["incoming"], r["short"]), (8, 6, False))
+        self.assertEqual(r["suggested_qty"], 5 + 26 - 14)
+
+    def test_corrected_usage_counts_corrected_value(self):
+        u = self.use(20, "u1", "2026-10-25 10:00:00")
+        inv.correct(self.conn, u, 6, "c", "20으로 잘못 입력")
+        self.conn.execute("UPDATE stock_movements SET created_at='2026-10-25 11:00:00' WHERE kind='correction'")
+        self.assertEqual(self.row()["daily_use"], round(6 / 7, 1))
+
+    def test_no_usage(self):
+        r = self.row()
+        self.assertIsNone(r["days_left"])
+        self.assertEqual(r["suggested_qty"], 0)
+
+
 class Concurrency(unittest.TestCase):
     def test_parallel_usage_sums_correctly(self):
         path = os.path.join(tempfile.mkdtemp(), "t.db")

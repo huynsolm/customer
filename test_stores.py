@@ -303,10 +303,29 @@ class Seed(unittest.TestCase):
         c = inv.connect(self.db)
         self.assertEqual(inv.list_items(c), [])  # 첫 번째 품목도 남지 않는다
         self.assertIsNone(c.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone())
-        self.assertFalse(c.in_transaction)
         c.close()
         self.server.seed()  # 다시 시작하면 정확히 5개
         self.assertEqual(len(self.names()), 5)
+
+    def test_failed_seed_leaves_the_same_connection_usable(self):
+        """실패한 바로 그 연결이 트랜잭션을 닫고 롤백했는지(새 연결이 아니라 실패한 연결을 검사한다)."""
+        c = inv.connect(self.db)
+        real = inv._add_item_locked
+        calls = []
+
+        def flaky(*args, **kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("두 번째 삽입 실패")
+            return real(*args, **kw)
+        with mock.patch.object(inv, "_add_item_locked", flaky):
+            with self.assertRaises(RuntimeError):
+                inv.seed_once(c, self.server.SEED)
+        self.assertFalse(c.in_transaction)
+        self.assertEqual(inv.list_items(c), [])
+        self.assertTrue(inv.seed_once(c, self.server.SEED))  # 같은 연결로 바로 다시 시도해 성공
+        self.assertEqual(len(inv.list_items(c)), 5)
+        c.close()
 
     def test_concurrent_first_start(self):
         """10차 #2: 동시에 처음 시작한 서버 중 하나가 이름 중복으로 실패하던 문제."""

@@ -2,7 +2,7 @@
 
 ```bash
 python server.py            # http://localhost:8000 (cafe.db 자동 생성, 샘플 품목 5개)
-python -m unittest -v       # 서버·로직 테스트 96개(업무 사례 포함, OpenAI API는 호출하지 않음)
+python -m unittest -v       # 서버·로직 테스트 97개(업무 사례 포함, OpenAI API는 호출하지 않음)
 node --test test_client.mjs # 화면 요청 처리 테스트 8개(client.js)
 ```
 

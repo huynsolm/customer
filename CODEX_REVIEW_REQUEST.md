@@ -14,7 +14,7 @@
 ## 실행
 ```bash
 python -m pip install -r requirements.txt   # openai (없어도 테스트 대부분 통과, RealSdk 테스트만 건너뜀)
-python -m unittest -v                        # 96개
+python -m unittest -v                        # 97개
 node --test test_client.mjs                  # 8개
 ```
 실제 OpenAI 서버는 호출하지 않는다(API 키 없음). `RealSdk` 테스트는 진짜 `openai` SDK + `httpx.MockTransport`.

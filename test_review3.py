@@ -39,7 +39,7 @@ class LegacyNullRequest(unittest.TestCase):
 
     def test_opening_key_cannot_be_reused(self):
         with self.assertRaises(inv.InventoryError):
-            inv.record_out(self.conn, self.milk, 1, "use", "opening-%d" % self.milk)
+            inv.record_out(self.conn, self.milk, 1, "use", inv.history(self.conn, self.milk)[0]["idempotency_key"])
 
     def test_unrecoverable_legacy_stocktake_rejected(self):
         legacy_row(self.conn, self.milk, "adjustment", 0, "old-count")

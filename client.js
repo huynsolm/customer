@@ -11,7 +11,7 @@ function intOf(value, min, label) {
 // 같은 키를 써서 서버가 한 번만 반영하게 한다. 처리 중인 같은 요청을 다시 누르는 경우(더블클릭)도 같다.
 // 메모리가 기본 상태이고 storage(sessionStorage)는 새로고침 대비 보존용이다. storage를 쓸 수 없어도
 // 메모리로는 계속 막고, persisted()가 false가 되어 화면이 "새로고침하면 복구할 수 없음"을 알린다.
-function createSender({ fetch, storage, uid, onChange = () => {} }) {
+function createSender({ fetch, storage, uid, actor = () => '', onChange = () => {} }) {
   const NAME = 'pendingRequests';
   let pending = {};
   let persisted = true;
@@ -27,6 +27,7 @@ function createSender({ fetch, storage, uid, onChange = () => {} }) {
   }
 
   async function send(path, body) {
+    const who = actor();  // 작업자가 없으면 여기서 던져 요청을 만들지 않는다
     const sig = path + ' ' + JSON.stringify(body);
     const key = pending[sig]?.key || uid();
     pending[sig] = { path, body, key };
@@ -34,7 +35,7 @@ function createSender({ fetch, storage, uid, onChange = () => {} }) {
     track(sig, 1);
     let r;
     try {
-      r = await fetch(path, { method: 'POST', body: JSON.stringify({ ...body, key }) });
+      r = await fetch(path, { method: 'POST', body: JSON.stringify({ ...body, key, actor: who }) });
     } catch {
       track(sig, -1);
       onChange();  // 첫 실패 직후에도 재전송 안내가 바로 보이게 한다

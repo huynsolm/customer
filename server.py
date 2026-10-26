@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import traceback
+from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import inventory as inv
@@ -28,29 +29,49 @@ def seed():
             inv.add_item(c, n, u, r, o)
 
 
-def route(conn, method, path, body):
+def store_of(conn, query):
+    """?store=번호. 없으면 기본 매장. 없는 매장이면 빈 매장으로 보이지 않게 오류로 답한다."""
+    v = (query.get("store") or [str(inv.DEFAULT_STORE)])[0]
+    if not v.isdigit():
+        raise inv.InventoryError("매장 번호가 올바르지 않습니다")
+    inv.need_store(conn, int(v))
+    return int(v)
+
+
+def route(conn, method, path, body, query=None):
+    query = query or {}
     parts = path.strip("/").split("/")
     if method == "GET":
+        if parts == ["api", "stores"]:
+            return inv.list_stores(conn)
         if parts == ["api", "items"]:
-            return inv.list_items(conn)
+            return inv.list_items(conn, store_of(conn, query))
         if parts == ["api", "pos"]:
-            return inv.list_pos(conn)
+            return inv.list_pos(conn, store_of(conn, query))
         if parts[:2] == ["api", "history"]:
             return inv.history(conn, int(parts[2]))
         if parts == ["api", "shortage"]:
-            rows = inv.shortage_report(conn)
+            rows = inv.shortage_report(conn, store_id=store_of(conn, query))
             return {"rows": rows, "summary": summary.template_summary(rows)}
     elif method == "POST":
         a = body.get("actor", "")
         if parts == ["api", "shortage", "ai"]:
-            text, source, note = summary.ai_summary(inv.shortage_report(conn))
+            text, source, note = summary.ai_summary(inv.shortage_report(conn, store_id=store_of(conn, query)))
             return {"summary": text, "source": source, "note": note}
+        if parts == ["api", "stores"]:
+            return {"id": inv.add_store(conn, body["name"], body.get("key"))}
+        if parts == ["api", "items"]:
+            return {"id": inv.add_item(conn, body["name"], body["unit"], body.get("reorder_point", 0),
+                                       body.get("opening", 0), body.get("key"),
+                                       body.get("store_id", inv.DEFAULT_STORE), a)}
+        if parts == ["api", "items", "update"]:
+            return {"id": inv.update_item(conn, body["item_id"], body["name"], body["reorder_point"], a)}
         if parts == ["api", "pos"]:
-            return {"id": inv.create_po(conn, body["item_id"], body["qty"], body.get("key"))}
+            return {"id": inv.create_po(conn, body["item_id"], body["qty"], body.get("key"), a)}
         if parts[:2] == ["api", "pos"] and parts[3] == "receive":
             return {"id": inv.receive(conn, int(parts[2]), body["qty"], body["key"], a)}
         if parts[:2] == ["api", "pos"] and parts[3] == "cancel":
-            return {"cancelled": inv.cancel_remaining(conn, int(parts[2]), body.get("reason", ""))}
+            return {"cancelled": inv.cancel_remaining(conn, int(parts[2]), body.get("reason", ""), a)}
         if parts == ["api", "out"]:
             return {"id": inv.record_out(conn, body["item_id"], body["qty"], body["kind"], body["key"], a, body.get("note", ""))}
         if parts == ["api", "stocktake"]:
@@ -72,7 +93,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle(self, method):
-        static = STATIC.get(self.path) if method == "GET" else None
+        url = urlsplit(self.path)
+        static = STATIC.get(url.path) if method == "GET" else None
         if static:
             name, ctype = static
             with open(os.path.join(HERE, name), "rb") as f:
@@ -92,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise inv.InventoryError("요청 본문은 JSON 객체여야 합니다")
             conn = inv.connect(DB)
             try:
-                self._send(200, route(conn, method, self.path.split("?")[0], body))
+                self._send(200, route(conn, method, url.path, body, parse_qs(url.query)))
             finally:
                 conn.close()
         except inv.InventoryError as e:

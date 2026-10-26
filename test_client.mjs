@@ -109,3 +109,16 @@ test('400 응답은 결과가 확정된 것이라 지우고, 500은 남긴다', 
   calls[1].ok(500); await p.catch(() => {});
   assert.equal(s.unresolved(), 1);
 });
+
+test('작업자 이름을 요청에 싣고, 없으면 요청을 만들지 않는다', async () => {
+  const bodies = [];
+  const fetch = async (path, opts) => { bodies.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({}) }; };
+  let who = '';
+  const s = createSender({ fetch, storage: memoryStorage(), uid: ids(), actor: () => { if (!who) throw new Error('작업자'); return who; } });
+  await assert.rejects(s.send('/api/pos', { item_id: 1, qty: 7 }), /작업자/);
+  assert.equal(bodies.length, 0);
+  assert.equal(s.unresolved(), 0);  // 보내지 않은 요청이 재전송 대기에 남지 않는다
+  who = '민수';
+  await s.send('/api/pos', { item_id: 1, qty: 7 });
+  assert.deepEqual(bodies, [{ item_id: 1, qty: 7, key: 'k1', actor: '민수' }]);
+});

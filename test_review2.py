@@ -102,11 +102,11 @@ class ShortageWindow(unittest.TestCase):
         real = inv.list_items
         fired = []
 
-        def list_items_after_receipt(conn):
+        def list_items_after_receipt(conn, *args):
             if not fired:
                 fired.append(1)
                 inv.receive(b, po, 10, "r")  # 보고서가 발주 목록을 읽은 뒤 다른 연결에서 입고
-            return real(conn)
+            return real(conn, *args)
 
         with mock.patch.object(inv, "list_items", list_items_after_receipt):
             r = inv.shortage_report(a)[0]

@@ -2,17 +2,25 @@
 import contextlib
 import json
 import sqlite3
+import time
+import uuid
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS stores (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, idempotency_key TEXT
+);
 CREATE TABLE IF NOT EXISTS items (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, unit TEXT NOT NULL,
-  reorder_point INTEGER NOT NULL DEFAULT 0
+  id INTEGER PRIMARY KEY, store_id INTEGER NOT NULL DEFAULT 1 REFERENCES stores(id),
+  name TEXT NOT NULL, unit TEXT NOT NULL,
+  reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT
 );
 CREATE TABLE IF NOT EXISTS purchase_orders (
   id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(id),
   ordered_qty INTEGER NOT NULL CHECK (ordered_qty > 0),
   cancelled_qty INTEGER NOT NULL DEFAULT 0,
   cancel_reason TEXT,
+  created_by TEXT NOT NULL DEFAULT '',
+  cancelled_by TEXT NOT NULL DEFAULT '',
   idempotency_key TEXT UNIQUE,
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
@@ -34,6 +42,13 @@ CREATE INDEX IF NOT EXISTS idx_movements_po ON stock_movements(po_id);
 CREATE INDEX IF NOT EXISTS idx_movements_corrects ON stock_movements(corrects_id);
 CREATE INDEX IF NOT EXISTS idx_movements_kind_time ON stock_movements(kind, created_at);
 """
+# 이전 버전 DB에는 없는 컬럼에 거는 인덱스라 마이그레이션 뒤에 만든다.
+INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_store_name ON items(store_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_key ON items(idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stores_key ON stores(idempotency_key);
+"""
+DEFAULT_STORE = 1
 
 
 class InventoryError(Exception):
@@ -46,12 +61,72 @@ def connect(path=":memory:"):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     if path != ":memory:":
-        conn.execute("PRAGMA journal_mode=WAL")
+        _enable_wal(conn)
     conn.executescript(SCHEMA)
-    # 이전 버전 DB에는 request 컬럼이 없다. 기존 기록은 request가 NULL로 남는다.
-    if "request" not in {r["name"] for r in conn.execute("PRAGMA table_info(stock_movements)")}:
-        conn.execute("ALTER TABLE stock_movements ADD COLUMN request TEXT")
+    _migrate(conn)
+    conn.executescript(INDEXES)
     return conn
+
+
+def _enable_wal(conn):
+    """여러 연결이 동시에 처음 열리면 WAL 전환이 busy timeout을 기다리지 않고 바로 실패할 수 있어 다시 시도한다."""
+    for attempt in range(100):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if attempt == 99:
+                raise
+            time.sleep(0.05)
+
+
+def _columns(conn, table):
+    return {r["name"] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
+def _needs_migration(conn):
+    return ("request" not in _columns(conn, "stock_movements")
+            or not {"created_by", "cancelled_by"} <= _columns(conn, "purchase_orders")
+            or "store_id" not in _columns(conn, "items")
+            or not conn.execute("SELECT 1 FROM stores WHERE id=?", (DEFAULT_STORE,)).fetchone())
+
+
+def _migrate(conn):
+    """이전 버전 DB를 현재 구조로 올린다. 기존 기록은 지우지 않는다. 연결이 동시에 열려도 한 번만 실행한다."""
+    if not _needs_migration(conn):
+        return
+    conn.execute("PRAGMA foreign_keys=OFF")  # 테이블을 다시 만드는 동안 참조 검사를 끈다(트랜잭션 밖에서만 바뀐다)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _needs_migration(conn):  # 기다리는 사이 다른 연결이 끝냈을 수 있다
+                _migrate_locked(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_locked(conn):
+    if "request" not in _columns(conn, "stock_movements"):
+        conn.execute("ALTER TABLE stock_movements ADD COLUMN request TEXT")  # 기존 기록은 request가 NULL
+    for col in ("created_by", "cancelled_by"):
+        if col not in _columns(conn, "purchase_orders"):
+            conn.execute("ALTER TABLE purchase_orders ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % col)
+    conn.execute("INSERT OR IGNORE INTO stores(id,name) VALUES(?, '본점')", (DEFAULT_STORE,))
+    if "store_id" not in _columns(conn, "items"):
+        # 이전 items는 name이 전체에서 유일(UNIQUE)이라 매장별로 같은 이름을 쓰려면 테이블을 다시 만들어야 한다.
+        conn.execute("CREATE TABLE items_new (id INTEGER PRIMARY KEY,"
+                     " store_id INTEGER NOT NULL DEFAULT 1 REFERENCES stores(id),"
+                     " name TEXT NOT NULL, unit TEXT NOT NULL,"
+                     " reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT)")
+        conn.execute("INSERT INTO items_new(id,store_id,name,unit,reorder_point)"
+                     " SELECT id,?,name,unit,reorder_point FROM items", (DEFAULT_STORE,))
+        conn.execute("DROP TABLE items")
+        conn.execute("ALTER TABLE items_new RENAME TO items")
 
 
 @contextlib.contextmanager
@@ -180,23 +255,95 @@ def _insert(conn, **m):
 
 
 # ---------- 조회 ----------
-def add_item(conn, name, unit, reorder_point=0, opening=0, key=None):
+MAX_NAME = 50
+
+
+def _clean_name(v, label):
+    if not isinstance(v, str) or not v.strip() or len(v.strip()) > MAX_NAME:
+        raise InventoryError("%s은 1~%d자의 글자여야 합니다" % (label, MAX_NAME))
+    return v.strip()
+
+
+def list_stores(conn):
+    return [dict(r) for r in conn.execute("SELECT id, name FROM stores ORDER BY id")]
+
+
+def add_store(conn, name, key=None):
+    name = _clean_name(name, "매장 이름")
+    if key is not None:
+        _need_key(key)
+    with tx(conn):
+        if key is not None:
+            done = conn.execute("SELECT * FROM stores WHERE idempotency_key=?", (key,)).fetchone()
+            if done:
+                if done["name"] != name:
+                    raise InventoryError("같은 요청 키로 다른 매장이 이미 등록되어 있습니다")
+                return done["id"]
+        if conn.execute("SELECT 1 FROM stores WHERE name=?", (name,)).fetchone():
+            raise InventoryError("같은 이름의 매장이 이미 있습니다")
+        return conn.execute("INSERT INTO stores(name,idempotency_key) VALUES(?,?)", (name, key)).lastrowid
+
+
+def need_store(conn, store_id):
+    _need_id(store_id, "매장")
+    if not conn.execute("SELECT 1 FROM stores WHERE id=?", (store_id,)).fetchone():
+        raise InventoryError("매장을 찾을 수 없습니다")
+
+
+def add_item(conn, name, unit, reorder_point=0, opening=0, key=None, store_id=DEFAULT_STORE, actor=""):
+    """품목 추가. 같은 key로 다시 호출하면(더블클릭·재전송) 이전 결과를 돌려주고 품목은 늘지 않는다."""
+    name = _clean_name(name, "품목 이름")
+    unit = _clean_name(unit, "단위")
     _need_int(reorder_point, 0, "발주 기준")
     _need_int(opening, 0, "기초 재고")
+    _need_text(actor, "작업자")
+    if key is not None:
+        _need_key(key)
+    request = _request(op="add_item", store_id=store_id, name=name, unit=unit,
+                       reorder_point=reorder_point, opening=opening)
     with tx(conn):
+        if key is not None:
+            done = conn.execute("SELECT * FROM items WHERE idempotency_key=?", (key,)).fetchone()
+            if done:
+                if done["request"] != request:
+                    raise InventoryError("같은 요청 키로 다른 품목이 이미 등록되어 있습니다")
+                return done["id"]
+        need_store(conn, store_id)
+        if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=?", (store_id, name)).fetchone():
+            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다")
         item_id = conn.execute(
-            "INSERT INTO items(name,unit,reorder_point) VALUES(?,?,?)", (name, unit, reorder_point)
-        ).lastrowid
+            "INSERT INTO items(store_id,name,unit,reorder_point,idempotency_key,request) VALUES(?,?,?,?,?,?)",
+            (store_id, name, unit, reorder_point, key, request)).lastrowid
         if opening:
-            _insert(conn, item_id=item_id, kind="opening", delta=opening, key=key or "opening-%d" % item_id,
-                    request=_request(op="opening", item_id=item_id, qty=opening), note="기초 재고")
+            _insert(conn, item_id=item_id, kind="opening", delta=opening, key="opening-" + uuid.uuid4().hex,  # 사용자가 쓴 요청 키와 겹치지 않게 내부에서 만든다
+                    request=_request(op="opening", item_id=item_id, qty=opening), actor=actor, note="기초 재고")
     return item_id
 
 
-def list_items(conn):
+def update_item(conn, item_id, name, reorder_point, actor=""):
+    """품목 이름·발주 기준 수정. 같은 값으로 다시 호출해도 결과가 같다(재전송 안전). 단위는 기존 이력의 뜻이 바뀌므로 고치지 않는다."""
+    _need_id(item_id, "품목")
+    name = _clean_name(name, "품목 이름")
+    _need_int(reorder_point, 0, "발주 기준")
+    _need_text(actor, "작업자")
+    with tx(conn):
+        item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise InventoryError("품목을 찾을 수 없습니다")
+        if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=? AND id<>?",
+                        (item["store_id"], name, item_id)).fetchone():
+            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다")
+        # items.request는 처음 추가 요청의 지문이라 그대로 둔다. 수정 뒤에 추가 요청이 재전송돼도 처음 결과를 돌려준다.
+        conn.execute("UPDATE items SET name=?, reorder_point=? WHERE id=?", (name, reorder_point, item_id))
+    return item_id
+
+
+def list_items(conn, store_id=None):
+    """store_id가 None이면 모든 매장의 품목."""
     rows = conn.execute(
-        "SELECT i.*, COALESCE(SUM(m.delta),0) AS stock FROM items i"
-        " LEFT JOIN stock_movements m ON m.item_id=i.id GROUP BY i.id ORDER BY i.id"
+        "SELECT i.id, i.store_id, i.name, i.unit, i.reorder_point, COALESCE(SUM(m.delta),0) AS stock FROM items i"
+        " LEFT JOIN stock_movements m ON m.item_id=i.id WHERE (?1 IS NULL OR i.store_id=?1)"
+        " GROUP BY i.id ORDER BY i.id", (store_id,)
     ).fetchall()
     return [dict(r, low=r["stock"] <= r["reorder_point"]) for r in rows]
 
@@ -214,9 +361,11 @@ def get_po(conn, po_id):
     return dict(po, received=received, remaining=remaining, status=_po_status(po, received))
 
 
-def list_pos(conn):
+def list_pos(conn, store_id=None):
     with snapshot(conn):
-        ids = [r[0] for r in conn.execute("SELECT id FROM purchase_orders ORDER BY id DESC")]
+        ids = [r[0] for r in conn.execute(
+            "SELECT p.id FROM purchase_orders p JOIN items i ON i.id=p.item_id"
+            " WHERE (?1 IS NULL OR i.store_id=?1) ORDER BY p.id DESC", (store_id,))]
         return [get_po(conn, i) for i in ids]
 
 
@@ -244,13 +393,13 @@ USAGE_SQL = (
 )
 
 
-def shortage_report(conn, now=None):
+def shortage_report(conn, now=None, store_id=None):
     """부족 품목과 권장 발주량. 숫자는 모두 여기서 계산하고, AI는 이 결과를 문장으로만 바꾼다."""
     with snapshot(conn):
         now = now or conn.execute("SELECT datetime('now','localtime')").fetchone()[0]
         since = conn.execute("SELECT datetime(?, ?)", (now, "-%d days" % USAGE_DAYS)).fetchone()[0]
-        pos = list_pos(conn)
-        items = list_items(conn)
+        pos = list_pos(conn, store_id)
+        items = list_items(conn, store_id)
         used_by_item = dict(conn.execute(USAGE_SQL, (now, since, now)).fetchall())
     rows = []
     for it in items:
@@ -271,9 +420,10 @@ def shortage_report(conn, now=None):
 
 
 # ---------- 발주·입고 ----------
-def create_po(conn, item_id, qty, key=None):
+def create_po(conn, item_id, qty, key=None, actor=""):
     _need_id(item_id, "품목")
     _need_positive(qty)
+    _need_text(actor, "작업자")
     if key is not None:
         _need_key(key)
     with tx(conn):
@@ -285,8 +435,8 @@ def create_po(conn, item_id, qty, key=None):
                 return done["id"]
         _need_item(conn, item_id)
         return conn.execute(
-            "INSERT INTO purchase_orders(item_id,ordered_qty,idempotency_key) VALUES(?,?,?)",
-            (item_id, qty, key),
+            "INSERT INTO purchase_orders(item_id,ordered_qty,idempotency_key,created_by) VALUES(?,?,?,?)",
+            (item_id, qty, key, actor),
         ).lastrowid
 
 
@@ -308,15 +458,16 @@ def receive(conn, po_id, qty, key, actor=""):
                        key=key, request=request, actor=actor, note="발주 PO-%d 입고" % po_id)
 
 
-def cancel_remaining(conn, po_id, reason):
+def cancel_remaining(conn, po_id, reason, actor=""):
     _need_id(po_id, "발주")
     _need_text(reason, "취소 사유")
+    _need_text(actor, "작업자")
     with tx(conn):
         po = get_po(conn, po_id)
         if po["remaining"] == 0:
             raise InventoryError("취소할 잔량이 없습니다")
-        conn.execute("UPDATE purchase_orders SET cancelled_qty=cancelled_qty+?, cancel_reason=? WHERE id=?",
-                     (po["remaining"], reason, po_id))
+        conn.execute("UPDATE purchase_orders SET cancelled_qty=cancelled_qty+?, cancel_reason=?, cancelled_by=? WHERE id=?",
+                     (po["remaining"], reason, actor, po_id))
         return po["remaining"]
 
 

@@ -1,13 +1,14 @@
 """부족 품목 요약. 숫자는 inventory.shortage_report가 계산하고, 문장은 서버가 조립한다.
 
-Claude는 자유 문장을 쓰지 않는다. 구조화된 출력(JSON 스키마)으로 부족 품목의 급한 순서와
-품목마다 정해진 안내 문구 중 하나(ADVICE)만 고른다. 그래서 Claude가 수량·단위·기간을 쓰거나
+ChatGPT(OpenAI API)는 자유 문장을 쓰지 않는다. 구조화된 출력(JSON 스키마)으로 부족 품목의 급한 순서와
+품목마다 정해진 안내 문구 중 하나(ADVICE)만 고른다. 그래서 모델이 수량·단위·기간을 쓰거나
 품목 이름 속 지시문에 따라 문장 내용을 바꿀 수 없다. 응답이 규칙에 맞지 않거나,
-anthropic 패키지·인증 정보가 없거나 호출이 실패하면 규칙 기반 문장(template)으로 대신한다.
+openai 패키지·인증 정보가 없거나 호출이 실패하면 규칙 기반 문장(template)으로 대신한다.
 """
 import json
+import os
 
-MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "gpt-4o-mini"  # 환경변수 OPENAI_MODEL로 바꾼다. 구조화된 출력(json_schema)을 지원하는 모델이어야 한다.
 ADVICE = {
     "today": "오늘 주문하세요",
     "this_week": "이번 주 안에 주문하세요",
@@ -69,7 +70,7 @@ def template_summary(rows):
 
 
 def render(text, rows):
-    """Claude가 고른 순서·안내를 검사하고 문장을 조립한다. 쓸 수 없으면 (None, 이유)."""
+    """모델이 고른 순서·안내를 검사하고 문장을 조립한다. 쓸 수 없으면 (None, 이유)."""
     try:
         picked = json.loads(text)["items"]
         pairs = [(p["item_id"], p["advice"]) for p in picked]
@@ -87,41 +88,47 @@ def render(text, rows):
 
 
 def ai_summary(rows, client=None):
-    """(문장, 출처, 비고)를 돌려준다. 출처는 'claude' 또는 'template'."""
+    """(문장, 출처, 비고)를 돌려준다. 출처는 'openai' 또는 'template'."""
     fallback = template_summary(rows)
     if not any(r["short"] for r in rows):
-        return fallback, "template", "부족 품목이 없어 Claude를 부르지 않음"
+        return fallback, "template", "부족 품목이 없어 AI를 부르지 않음"
     try:
-        import anthropic
+        import openai
     except ImportError:
-        return fallback, "template", "anthropic 패키지가 설치되지 않음"
+        return fallback, "template", "openai 패키지가 설치되지 않음"
     try:
-        client = client or anthropic.Anthropic()
-        resp = client.beta.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
-            system=SYSTEM,
-            messages=[{"role": "user", "content": json.dumps(rows, ensure_ascii=False)}],
+        client = client or openai.OpenAI()  # OPENAI_API_KEY가 없으면 여기서 OpenAIError
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL") or DEFAULT_MODEL,
+            max_completion_tokens=2000,
+            response_format={"type": "json_schema",
+                             "json_schema": {"name": "shortage_advice", "strict": True, "schema": SCHEMA}},
+            messages=[{"role": "system", "content": SYSTEM},
+                      {"role": "user", "content": json.dumps(rows, ensure_ascii=False)}],
         )
-    except anthropic.AuthenticationError:
-        return fallback, "template", "Claude 인증 정보가 없거나 잘못됨"
-    except anthropic.RateLimitError:
-        return fallback, "template", "Claude 사용량 한도 초과"
-    except anthropic.APIStatusError as e:
-        return fallback, "template", "Claude API 오류(%s)" % e.status_code
-    except anthropic.APIConnectionError:
-        return fallback, "template", "Claude에 연결할 수 없음"
-    except anthropic.AnthropicError as e:
-        return fallback, "template", "Claude 클라이언트 오류: %s" % e
-    if resp.stop_reason == "refusal":
-        return fallback, "template", "Claude가 요청을 거절함"
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except openai.AuthenticationError:
+        return fallback, "template", "OpenAI 인증 정보가 없거나 잘못됨"
+    except openai.RateLimitError:
+        return fallback, "template", "OpenAI 사용량 한도 초과"
+    except openai.APIStatusError as e:
+        return fallback, "template", "OpenAI API 오류(%s)" % e.status_code
+    except openai.APIConnectionError:
+        return fallback, "template", "OpenAI에 연결할 수 없음"
+    except openai.OpenAIError as e:
+        return fallback, "template", "OpenAI 클라이언트 오류: %s" % e
+    try:
+        choice = resp.choices[0]
+        message = choice.message
+    except (AttributeError, IndexError, TypeError):
+        return fallback, "template", "OpenAI 응답 형식이 맞지 않음"
+    if getattr(message, "refusal", None):
+        return fallback, "template", "AI가 요청을 거절함"
+    if choice.finish_reason != "stop":
+        return fallback, "template", "AI 응답이 끝까지 오지 않음(%s)" % choice.finish_reason
+    text = (message.content or "").strip()
     if not text:
-        return fallback, "template", "Claude 응답이 비어 있음"
+        return fallback, "template", "AI 응답이 비어 있음"
     rendered, why = render(text, rows)
     if rendered is None:
-        return fallback, "template", "Claude 응답을 쓰지 않음: " + why
-    return rendered, "claude", ""
+        return fallback, "template", "AI 응답을 쓰지 않음: " + why
+    return rendered, "openai", ""

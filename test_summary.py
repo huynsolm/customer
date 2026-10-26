@@ -1,4 +1,5 @@
-"""summary.py 테스트. 실제 Claude API는 호출하지 않고 가짜 클라이언트를 쓴다."""
+"""summary.py 테스트. 실제 OpenAI API는 호출하지 않고 가짜 클라이언트를 쓴다."""
+import importlib.util
 import json
 import sys
 import types
@@ -17,32 +18,33 @@ CUP = {"item_id": 3, "name": "컵(12oz)", "unit": "개", "stock": 40, "incoming"
        "daily_use": 11.4, "days_left": 3.5, "short": True, "suggested_qty": 90}
 
 
-def fake_anthropic():
-    """anthropic 패키지 흉내. 예외 클래스 계층만 실제와 같게 둔다."""
-    m = types.ModuleType("anthropic")
+def fake_openai():
+    """openai 패키지 흉내. 예외 클래스 계층만 실제와 같게 둔다."""
+    m = types.ModuleType("openai")
 
-    class AnthropicError(Exception): pass
-    class APIConnectionError(AnthropicError): pass
-    class APIStatusError(AnthropicError):
+    class OpenAIError(Exception): pass
+    class APIError(OpenAIError): pass
+    class APIConnectionError(APIError): pass
+    class APIStatusError(APIError):
         status_code = 500
     class AuthenticationError(APIStatusError): pass
     class RateLimitError(APIStatusError): pass
-    for c in (AnthropicError, APIConnectionError, APIStatusError, AuthenticationError, RateLimitError):
+    for c in (OpenAIError, APIConnectionError, APIStatusError, AuthenticationError, RateLimitError):
         setattr(m, c.__name__, c)
     return m
 
 
-def client_returning(text, stop_reason="end_turn"):
-    resp = types.SimpleNamespace(stop_reason=stop_reason,
-                                 content=[types.SimpleNamespace(type="text", text=text)])
+def client_returning(text, finish_reason="stop", refusal=None):
+    resp = types.SimpleNamespace(choices=[types.SimpleNamespace(
+        finish_reason=finish_reason, message=types.SimpleNamespace(content=text, refusal=refusal))])
     create = mock.Mock(return_value=resp)
-    return types.SimpleNamespace(beta=types.SimpleNamespace(messages=types.SimpleNamespace(create=create))), create
+    return types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))), create
 
 
 class Summary(unittest.TestCase):
     def setUp(self):
-        self.mod = fake_anthropic()
-        patcher = mock.patch.dict(sys.modules, {"anthropic": self.mod})
+        self.mod = fake_openai()
+        patcher = mock.patch.dict(sys.modules, {"openai": self.mod})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -56,13 +58,20 @@ class Summary(unittest.TestCase):
                                        {"item_id": 1, "advice": "today"}]})
         client, create = client_returning(picked)
         text, source, _ = summary.ai_summary(rows, client)
-        self.assertEqual(source, "claude")
+        self.assertEqual(source, "openai")
         self.assertEqual(text, "1. 컵(12oz) 90개 주문 권장(약 3.5일 분) — 입고 예정분이 언제 오는지 먼저 확인하세요. "
                                "2. 우유 27개 주문 권장(약 1.1일 분) — 오늘 주문하세요.")
         kw = create.call_args.kwargs
-        self.assertEqual(kw["model"], "claude-opus-5-5")
-        self.assertEqual(kw["fallbacks"], "default")
-        self.assertEqual(kw["output_config"]["format"]["schema"], summary.SCHEMA)
+        self.assertEqual(kw["model"], summary.DEFAULT_MODEL)
+        js = kw["response_format"]["json_schema"]
+        self.assertEqual((kw["response_format"]["type"], js["strict"], js["schema"]), ("json_schema", True, summary.SCHEMA))
+        self.assertEqual([m["role"] for m in kw["messages"]], ["system", "user"])
+
+    def test_model_from_env(self):
+        client, create = client_returning(json.dumps({"items": [{"item_id": 1, "advice": "today"}]}))
+        with mock.patch.dict("os.environ", {"OPENAI_MODEL": "my-model"}):
+            summary.ai_summary(ROWS, client)
+        self.assertEqual(create.call_args.kwargs["model"], "my-model")
 
     def test_rejects_free_text_and_bad_structure(self):
         """2차 #6·3차 #4·#8: 자유 문장은 어떤 내용이든(숫자, twenty, Ⅹ, 예순, 세일) 쓰지 않는다."""
@@ -85,24 +94,60 @@ class Summary(unittest.TestCase):
         # 이름은 데이터로 그대로 표시될 뿐, 숫자와 안내 문구는 서버가 정한 것만 나온다.
         self.assertEqual(text, "1. %s 27개 주문 권장(약 1.1일 분) — 오늘 주문하세요." % evil["name"])
 
-    def test_no_shortage_skips_claude(self):
+    def test_no_shortage_skips_ai(self):
         client, create = client_returning("x")
         self.assertEqual(summary.ai_summary(ROWS[1:], client)[1], "template")
         create.assert_not_called()
 
-    def test_refusal_falls_back(self):
-        client, _ = client_returning("", stop_reason="refusal")
-        self.assertEqual(summary.ai_summary(ROWS, client)[1], "template")
+    def test_refusal_and_truncation_fall_back(self):
+        for kw in ({"refusal": "거절"}, {"finish_reason": "length"}, {"finish_reason": "content_filter"}):
+            client, _ = client_returning("", **kw)
+            self.assertEqual(summary.ai_summary(ROWS, client)[1], "template", kw)
+
+    def test_missing_key_falls_back(self):
+        with mock.patch.object(self.mod, "OpenAI", side_effect=self.mod.OpenAIError("api_key"), create=True):
+            self.assertEqual(summary.ai_summary(ROWS)[1], "template")
 
     def test_api_error_falls_back(self):
         client, create = client_returning("")
         create.side_effect = self.mod.APIConnectionError()
         text, source, note = summary.ai_summary(ROWS, client)
-        self.assertEqual((source, note), ("template", "Claude에 연결할 수 없음"))
+        self.assertEqual((source, note), ("template", "OpenAI에 연결할 수 없음"))
 
     def test_missing_package_falls_back(self):
-        with mock.patch.dict(sys.modules, {"anthropic": None}):
-            self.assertEqual(summary.ai_summary(ROWS)[1:], ("template", "anthropic 패키지가 설치되지 않음"))
+        with mock.patch.dict(sys.modules, {"openai": None}):
+            self.assertEqual(summary.ai_summary(ROWS)[1:], ("template", "openai 패키지가 설치되지 않음"))
+
+
+@unittest.skipUnless(importlib.util.find_spec("openai") and importlib.util.find_spec("httpx"), "openai 패키지 없음")
+class RealSdk(unittest.TestCase):
+    """진짜 openai SDK로 요청을 만들고 응답을 읽는다. 네트워크 대신 가짜 전송 계층(httpx.MockTransport)을 쓴다."""
+
+    def run_with(self, status, payload):
+        import httpx, openai
+        seen = []
+
+        def handler(req):
+            seen.append(json.loads(req.content))
+            return httpx.Response(status, json=payload)
+        client = openai.OpenAI(api_key="test", max_retries=0,
+                               http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+        return summary.ai_summary(ROWS, client), seen
+
+    def test_success(self):
+        content = json.dumps({"items": [{"item_id": 1, "advice": "today"}]})
+        payload = {"id": "c", "object": "chat.completion", "created": 0, "model": "m", "choices": [
+            {"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content, "refusal": None}}]}
+        (text, source, note), seen = self.run_with(200, payload)
+        self.assertEqual((source, note), ("openai", ""))
+        self.assertIn("오늘 주문하세요", text)
+        self.assertEqual(seen[0]["response_format"]["json_schema"]["strict"], True)
+        self.assertEqual(seen[0]["model"], summary.DEFAULT_MODEL)
+
+    def test_http_errors_fall_back(self):
+        for status, note in ((401, "OpenAI 인증 정보가 없거나 잘못됨"), (429, "OpenAI 사용량 한도 초과"), (500, "OpenAI API 오류(500)")):
+            (text, source, got), _ = self.run_with(status, {"error": {"message": "x", "type": "t", "code": None}})
+            self.assertEqual((source, got), ("template", note))
 
 
 if __name__ == "__main__":

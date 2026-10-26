@@ -30,6 +30,11 @@
 <body>
 <main>
   <h1>카페 재고</h1>
+  <div class="row" id="who">
+    <label>매장 <select id="store"></select></label> <button id="addStore">매장 추가</button>
+    <label>작업자 <input id="actor" maxlength="30" placeholder="이름" style="width:110px"></label>
+    <span class="mut">기록마다 작업자 이름이 남습니다(로그인 없음).</span>
+  </div>
   <nav>
     <button data-v="stock" class="on">재고 목록</button>
     <button data-v="po">발주·입고</button>
@@ -47,7 +52,17 @@
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const uid = () => crypto.randomUUID();
-let view = 'stock', histItem = null, items = [];
+let view = 'stock', histItem = null, items = [], stores = [], store = 1;
+const pref = {  // 마지막 선택을 기억한다. 저장소를 쓸 수 없으면 기억만 못 할 뿐 동작은 같다.
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+store = +pref.get('store') || 1;
+const actor = () => {
+  const a = $('#actor').value.trim();
+  if (!a) throw new Error('작업자 이름을 먼저 입력하세요');
+  return a;
+};
 
 async function api(path, body) {
   const r = await fetch(path, body ? {method:'POST', body:JSON.stringify(body)} : {});
@@ -61,6 +76,7 @@ const sender = createSender({
   fetch: (...a) => fetch(...a),
   storage: (() => { try { return sessionStorage; } catch { return null; } })(),
   uid,
+  actor,
   onChange: updatePending,
 });
 const send = sender.send;
@@ -84,8 +100,17 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 let queue = Promise.resolve();
 function render() {
   return queue = queue.catch(() => {}).then(async () => {
-    items = await api('/api/items');
-    await ({stock: vStock, po: vPo, hist: vHist})[view]();
+    // 조회 중에 매장이 바뀌면 이 렌더 결과는 버린다(바뀐 매장의 렌더가 이어서 실행된다).
+    // 그러지 않으면 이전 매장의 품목 행에 새 매장의 정보가 섞이고, 그 행의 버튼이 다른 매장 품목에 기록한다.
+    let st = store;
+    stores = await api('/api/stores');
+    if (!stores.some(s => s.id === st)) store = st = stores[0].id;
+    if (st !== store) return;
+    $('#store').innerHTML = stores.map(s => `<option value="${s.id}" ${s.id === st ? 'selected' : ''}>${esc(s.name)}</option>`).join('');
+    const list = await api('/api/items?store=' + st);
+    if (st !== store) return;
+    items = list;
+    await ({stock: vStock, po: vPo, hist: vHist})[view](st);
     updatePending();
   });
 }
@@ -94,16 +119,21 @@ function itemOptions(sel) {
   return items.map(i => `<option value="${i.id}" ${i.id == sel ? 'selected' : ''}>${esc(i.name)}</option>`).join('');
 }
 
-async function vStock() {
-  const sh = await api('/api/shortage');
+async function vStock(st) {
+  const sh = await api('/api/shortage?store=' + st);
+  if (st !== store) return;
   const by = Object.fromEntries(sh.rows.map(r => [r.item_id, r]));
-  $('#view').innerHTML = `<div class="panel"><b>부족 품목 요약</b> <span class="tag" id="src">계산</span>
+  $('#view').innerHTML = `<div class="panel row" id="newitem"><b>품목 추가</b>
+      <input id="nn" placeholder="이름" maxlength="50" style="width:120px"> <input id="nu" placeholder="단위(개·kg)" maxlength="50" style="width:100px">
+      <input id="nr" type="number" min="0" placeholder="발주 기준" style="width:90px"> <input id="no" type="number" min="0" placeholder="기초 재고" style="width:90px">
+      <button id="nadd">추가</button></div>
+    <div class="panel"><b>부족 품목 요약</b> <span class="tag" id="src">계산</span>
       <p id="sum">${esc(sh.summary)}</p>
       <button id="ai">AI로 다시 쓰기</button> <span class="mut" id="ainote"></span></div>
     <div class="scroll"><table>
     <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th class="num">남은 일수</th><th class="num">권장 발주</th><th>사용·폐기 / 마감</th><th></th></tr>
     ${items.map(i => { const r = by[i.id]; return `<tr class="${r.short ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
-      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''}</td>
+      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''} <button data-a="edit">수정</button></td>
       <td class="num">${i.stock} ${esc(i.unit)}${r.incoming ? `<br><span class="mut">+${r.incoming} 입고 예정</span>` : ''}</td><td class="num">${i.reorder_point}</td>
       <td class="num">${r.days_left ?? '-'}</td>
       <td class="num">${r.suggested_qty ? `${r.suggested_qty} <button data-a="order" data-q="${r.suggested_qty}">발주</button>` : '-'}</td>
@@ -113,41 +143,52 @@ async function vStock() {
         <button data-a="count">마감</button></td></tr>`; }).join('')}
   </table></div>
   <p class="mut">남은 일수·권장 발주는 최근 7일 사용량 기준(가정: 일주일분 + 발주 기준). 사용·폐기·마감은 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
+  $('#nadd').onclick = () => act(async () => {
+    await send('/api/items', {store_id:st, name:$('#nn').value.trim(), unit:$('#nu').value.trim(),
+      reorder_point:intOf($('#nr').value || '0', 0, '발주 기준'), opening:intOf($('#no').value || '0', 0, '기초 재고')});
+  });
   $('#ai').onclick = async () => {
     // 응답을 기다리는 동안 화면을 옮기면 이 노드들은 사라진다. 그때 온 응답은 무시한다.
     const [btn, sum, src, note] = ['#ai', '#sum', '#src', '#ainote'].map(s => $(s));
     btn.disabled = true; note.textContent = '요약 중…';
     try {
-      const r = await api('/api/shortage/ai', {});
-      if (!sum.isConnected) return;
+      const r = await api('/api/shortage/ai?store=' + st, {});
+      if (st !== store || !sum.isConnected) return;
       sum.textContent = r.summary;
-      src.textContent = r.source === 'claude' ? 'Claude' : '계산';
+      src.textContent = r.source === 'openai' ? 'ChatGPT' : '계산';
       note.textContent = r.note;
     } catch (e) {
-      if (!sum.isConnected) return;
+      if (st !== store || !sum.isConnected) return;
       show(e); note.textContent = '';
     }
     btn.disabled = false;
   };
   document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
     const id = +tr.dataset.id;
-    if (b.dataset.a === 'order') await send('/api/pos', {item_id:id, qty:+b.dataset.q});
+    if (b.dataset.a === 'edit') {
+      const who = actor(), it = items.find(x => x.id === id);
+      const name = prompt('품목 이름', it.name); if (name === null) return;
+      const rp = prompt('발주 기준 수량', it.reorder_point); if (rp === null) return;
+      await api('/api/items/update', {item_id:id, name:name.trim(), reorder_point:intOf(rp, 0, '발주 기준'), actor:who});
+    } else if (b.dataset.a === 'order') await send('/api/pos', {item_id:id, qty:+b.dataset.q});
     else if (b.dataset.a === 'count') await send('/api/stocktake', {item_id:id, counted:intOf($('.c', tr).value, 0, '실사 수량')});
     else await send('/api/out', {item_id:id, qty:intOf($('.q', tr).value, 1, '수량'), kind:b.dataset.a});
   })));
 }
 
-async function vPo() {
-  const pos = await api('/api/pos');
+async function vPo(st) {
+  const pos = await api('/api/pos?store=' + st);
+  if (st !== store) return;
   $('#view').innerHTML = `<div class="row" id="newpo">
       <select id="pi">${itemOptions()}</select>
       <input id="pq" type="number" min="1" placeholder="주문 수량" style="width:110px">
       <button id="pgo">발주 등록</button></div>
     <div class="scroll"><table>
-    <tr><th>번호</th><th>품목</th><th class="num">주문</th><th class="num">입고</th><th>상태</th><th>입고 처리</th></tr>
+    <tr><th>번호</th><th>품목</th><th class="num">주문</th><th class="num">입고</th><th>상태</th><th>등록</th><th>입고 처리</th></tr>
     ${pos.map(p => `<tr data-id="${p.id}">
       <td>PO-${p.id}</td><td>${esc(p.item_name)}</td><td class="num">${p.ordered_qty}</td>
       <td class="num">${p.received}</td><td><span class="tag">${esc(p.status)}</span></td>
+      <td class="mut">${esc(p.created_by)}</td>
       <td>${p.remaining ? `<input type="number" min="1" class="q" style="width:70px" placeholder="잔량 ${p.remaining}">
         <button data-a="rcv">입고</button> <button data-a="cancel">잔량 취소</button>` : ''}</td></tr>`).join('')}
     </table></div>`;
@@ -157,22 +198,24 @@ async function vPo() {
     if (b.dataset.a === 'rcv') await send(`/api/pos/${id}/receive`, {qty:intOf($('.q', tr).value, 1, '입고 수량')});
     else {
       const reason = prompt('잔량 취소 사유'); if (reason === null) return;
-      await api(`/api/pos/${id}/cancel`, {reason});
+      await api(`/api/pos/${id}/cancel`, {reason, actor: actor()});
     }
   })));
 }
 
 const KIND = {opening:'기초 재고', receipt:'입고', use:'사용', waste:'폐기', correction:'정정', adjustment:'마감 조정'};
-async function vHist() {
-  histItem = histItem ?? items[0].id;
+async function vHist(st) {
+  if (!items.length) { $('#view').innerHTML = '<p class="mut">이 매장에는 아직 품목이 없습니다. 재고 목록에서 품목을 추가하세요.</p>'; return; }
+  if (!items.some(i => i.id === histItem)) histItem = items[0].id;
   const rows = await api('/api/history/' + histItem);
+  if (st !== store) return;
   let run = 0;
   const body = rows.map(r => { run += r.delta; return `<tr data-id="${r.id}">
     <td>${esc(r.created_at)}</td><td>${KIND[r.kind]}</td><td class="num">${r.delta > 0 ? '+' : ''}${r.delta}</td>
-    <td class="num">${run}</td><td class="mut">${esc(r.note)}</td>
+    <td class="num">${run}</td><td class="mut">${esc(r.note)}</td><td class="mut">${esc(r.actor)}</td>
     <td>${['receipt','use','waste'].includes(r.kind) ? '<button>정정</button>' : ''}</td></tr>`; }).join('');
   $('#view').innerHTML = `<div class="row"><select id="hi">${itemOptions(histItem)}</select></div>
-    <div class="scroll"><table><tr><th>시각</th><th>구분</th><th class="num">변동</th><th class="num">누계</th><th>비고</th><th></th></tr>${body}</table></div>
+    <div class="scroll"><table><tr><th>시각</th><th>구분</th><th class="num">변동</th><th class="num">누계</th><th>비고</th><th>작업자</th><th></th></tr>${body}</table></div>
     <p class="mut">기록은 삭제하지 않습니다. 정정하면 차이만큼의 정정 기록이 추가됩니다(0 입력 = 취소).</p>`;
   $('#hi').onchange = e => { histItem = +e.target.value; render(); };
   document.querySelectorAll('#view tr[data-id] button').forEach(b => b.onclick = () => act(async () => {
@@ -184,6 +227,14 @@ async function vHist() {
   }));
 }
 $('#resend').onclick = () => act(sender.resend);
+$('#actor').value = pref.get('actor') || '';
+$('#actor').onchange = e => pref.set('actor', e.target.value.trim());
+$('#store').onchange = e => { store = +e.target.value; pref.set('store', store); histItem = null; show(); render().catch(show); };
+$('#addStore').onclick = () => act(async () => {
+  const name = prompt('새 매장 이름'); if (name === null) return;
+  store = (await send('/api/stores', {name: name.trim()})).id;
+  pref.set('store', store); histItem = null;
+});
 render().catch(show);
 </script>
 </body>

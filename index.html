@@ -31,7 +31,7 @@
 <main>
   <h1>카페 재고</h1>
   <div class="row" id="who">
-    <label>매장 <select id="store"></select></label> <button id="addStore">매장 추가</button>
+    <label>매장 <select id="store"></select></label> <button id="addStore">매장 추가</button> <button id="renameStore">이름 변경</button>
     <label>작업자 <input id="actor" maxlength="30" placeholder="이름" style="width:110px"></label>
     <span class="mut">기록마다 작업자 이름이 남습니다(로그인 없음).</span>
   </div>
@@ -89,6 +89,9 @@ function updatePending() {
 
 const show = e => { $('#err').textContent = e ? e.message : ''; };
 async function act(fn) { try { show(); await fn(); await render(); } catch (e) { show(e); } }
+// 화면 안의 버튼은 그 화면을 그린 매장(st)에서만 동작한다. 매장을 바꾼 직후 남아 있는 이전 화면의 버튼이 다른 매장 품목을 바꾸지 않게 한다.
+const loading = () => { $('#view').innerHTML = '<p class="mut">불러오는 중…</p>'; };
+const actIn = (st, fn) => act(async () => { if (st !== store) return; await fn(); });
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   view = b.dataset.v;
@@ -120,7 +123,7 @@ function itemOptions(sel) {
 }
 
 async function vStock(st) {
-  const sh = await api('/api/shortage?store=' + st);
+  const [sh, archivedItems] = await Promise.all([api('/api/shortage?store=' + st), api('/api/items?archived=1&store=' + st)]);
   if (st !== store) return;
   const by = Object.fromEntries(sh.rows.map(r => [r.item_id, r]));
   $('#view').innerHTML = `<div class="panel row" id="newitem"><b>품목 추가</b>
@@ -133,7 +136,7 @@ async function vStock(st) {
     <div class="scroll"><table>
     <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th class="num">남은 일수</th><th class="num">권장 발주</th><th>사용·폐기 / 마감</th><th></th></tr>
     ${items.map(i => { const r = by[i.id]; return `<tr class="${r.short ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
-      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''} <button data-a="edit">수정</button></td>
+      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''} <button data-a="edit">수정</button> <button data-a="archive">보관</button></td>
       <td class="num">${i.stock} ${esc(i.unit)}${r.incoming ? `<br><span class="mut">+${r.incoming} 입고 예정</span>` : ''}</td><td class="num">${i.reorder_point}</td>
       <td class="num">${r.days_left ?? '-'}</td>
       <td class="num">${r.suggested_qty ? `${r.suggested_qty} <button data-a="order" data-q="${r.suggested_qty}">발주</button>` : '-'}</td>
@@ -142,8 +145,13 @@ async function vStock(st) {
       <td><input type="number" min="0" class="c" style="width:70px" aria-label="${esc(i.name)} 실사 수량">
         <button data-a="count">마감</button></td></tr>`; }).join('')}
   </table></div>
+  ${archivedItems.length ? `<details><summary>보관된 품목 ${archivedItems.length}개</summary><ul id="archived">${archivedItems.map(i =>
+    `<li data-id="${i.id}">${esc(i.name)} <button data-a="restore">복원</button></li>`).join('')}</ul></details>` : ''}
   <p class="mut">남은 일수·권장 발주는 최근 7일 사용량 기준(가정: 일주일분 + 발주 기준). 사용·폐기·마감은 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
-  $('#nadd').onclick = () => act(async () => {
+  document.querySelectorAll('#archived li button').forEach(b => b.onclick = () => actIn(st, async () => {
+    await api('/api/items/archive', {item_id:+b.closest('li').dataset.id, archived:false, actor:actor()});
+  }));
+  $('#nadd').onclick = () => actIn(st, async () => {
     await send('/api/items', {store_id:st, name:$('#nn').value.trim(), unit:$('#nu').value.trim(),
       reorder_point:intOf($('#nr').value || '0', 0, '발주 기준'), opening:intOf($('#no').value || '0', 0, '기초 재고')});
   });
@@ -163,13 +171,17 @@ async function vStock(st) {
     }
     btn.disabled = false;
   };
-  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
+  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => actIn(st, async () => {
     const id = +tr.dataset.id;
     if (b.dataset.a === 'edit') {
       const who = actor(), it = items.find(x => x.id === id);
       const name = prompt('품목 이름', it.name); if (name === null) return;
       const rp = prompt('발주 기준 수량', it.reorder_point); if (rp === null) return;
       await api('/api/items/update', {item_id:id, name:name.trim(), reorder_point:intOf(rp, 0, '발주 기준'), actor:who});
+    } else if (b.dataset.a === 'archive') {
+      const who = actor();
+      if (!confirm('이 품목을 보관할까요? 이력은 남고, 목록·부족 계산에서 빠집니다. 재고가 0이어야 합니다.')) return;
+      await api('/api/items/archive', {item_id:id, archived:true, actor:who});
     } else if (b.dataset.a === 'order') await send('/api/pos', {item_id:id, qty:+b.dataset.q});
     else if (b.dataset.a === 'count') await send('/api/stocktake', {item_id:id, counted:intOf($('.c', tr).value, 0, '실사 수량')});
     else await send('/api/out', {item_id:id, qty:intOf($('.q', tr).value, 1, '수량'), kind:b.dataset.a});
@@ -192,8 +204,8 @@ async function vPo(st) {
       <td>${p.remaining ? `<input type="number" min="1" class="q" style="width:70px" placeholder="잔량 ${p.remaining}">
         <button data-a="rcv">입고</button> <button data-a="cancel">잔량 취소</button>` : ''}</td></tr>`).join('')}
     </table></div>`;
-  $('#pgo').onclick = () => act(() => send('/api/pos', {item_id:+$('#pi').value, qty:intOf($('#pq').value, 1, '주문 수량')}));
-  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => act(async () => {
+  $('#pgo').onclick = () => actIn(st, () => send('/api/pos', {item_id:+$('#pi').value, qty:intOf($('#pq').value, 1, '주문 수량')}));
+  document.querySelectorAll('#view tr[data-id]').forEach(tr => tr.querySelectorAll('button').forEach(b => b.onclick = () => actIn(st, async () => {
     const id = tr.dataset.id;
     if (b.dataset.a === 'rcv') await send(`/api/pos/${id}/receive`, {qty:intOf($('.q', tr).value, 1, '입고 수량')});
     else {
@@ -203,11 +215,12 @@ async function vPo(st) {
   })));
 }
 
+const fmtChange = (field, v) => field === 'archived' ? (v === '1' ? '보관' : '사용 중') : v;
 const KIND = {opening:'기초 재고', receipt:'입고', use:'사용', waste:'폐기', correction:'정정', adjustment:'마감 조정'};
 async function vHist(st) {
   if (!items.length) { $('#view').innerHTML = '<p class="mut">이 매장에는 아직 품목이 없습니다. 재고 목록에서 품목을 추가하세요.</p>'; return; }
   if (!items.some(i => i.id === histItem)) histItem = items[0].id;
-  const rows = await api('/api/history/' + histItem);
+  const [rows, changes] = await Promise.all([api('/api/history/' + histItem), api('/api/item-changes/' + histItem)]);
   if (st !== store) return;
   let run = 0;
   const body = rows.map(r => { run += r.delta; return `<tr data-id="${r.id}">
@@ -216,9 +229,11 @@ async function vHist(st) {
     <td>${['receipt','use','waste'].includes(r.kind) ? '<button>정정</button>' : ''}</td></tr>`; }).join('');
   $('#view').innerHTML = `<div class="row"><select id="hi">${itemOptions(histItem)}</select></div>
     <div class="scroll"><table><tr><th>시각</th><th>구분</th><th class="num">변동</th><th class="num">누계</th><th>비고</th><th>작업자</th><th></th></tr>${body}</table></div>
-    <p class="mut">기록은 삭제하지 않습니다. 정정하면 차이만큼의 정정 기록이 추가됩니다(0 입력 = 취소).</p>`;
+    <p class="mut">기록은 삭제하지 않습니다. 정정하면 차이만큼의 정정 기록이 추가됩니다(0 입력 = 취소).</p>
+    ${changes.length ? `<h3>품목 정보 수정 이력</h3><div class="scroll"><table><tr><th>시각</th><th>항목</th><th>이전</th><th>이후</th><th>작업자</th></tr>
+      ${changes.map(c => `<tr><td>${esc(c.created_at)}</td><td>${{name:'이름', reorder_point:'발주 기준', archived:'보관'}[c.field]}</td><td>${esc(fmtChange(c.field, c.old_value))}</td><td>${esc(fmtChange(c.field, c.new_value))}</td><td class="mut">${esc(c.actor)}</td></tr>`).join('')}</table></div>` : ''}`;
   $('#hi').onchange = e => { histItem = +e.target.value; render(); };
-  document.querySelectorAll('#view tr[data-id] button').forEach(b => b.onclick = () => act(async () => {
+  document.querySelectorAll('#view tr[data-id] button').forEach(b => b.onclick = () => actIn(st, async () => {
     const tr = b.closest('tr');
     const q = prompt('올바른 수량(0 = 취소)'); if (q === null) return;
     const qty = intOf(q, 0, '정정 수량');
@@ -229,11 +244,16 @@ async function vHist(st) {
 $('#resend').onclick = () => act(sender.resend);
 $('#actor').value = pref.get('actor') || '';
 $('#actor').onchange = e => pref.set('actor', e.target.value.trim());
-$('#store').onchange = e => { store = +e.target.value; pref.set('store', store); histItem = null; show(); render().catch(show); };
+$('#store').onchange = e => { store = +e.target.value; pref.set('store', store); histItem = null; loading(); show(); render().catch(show); };
+$('#renameStore').onclick = () => act(async () => {
+  const cur = stores.find(s => s.id === store);
+  const name = prompt('매장 이름', cur.name); if (name === null) return;
+  await api('/api/stores/rename', {store_id:store, name:name.trim()});
+});
 $('#addStore').onclick = () => act(async () => {
   const name = prompt('새 매장 이름'); if (name === null) return;
   store = (await send('/api/stores', {name: name.trim()})).id;
-  pref.set('store', store); histItem = null;
+  pref.set('store', store); histItem = null; loading();
 });
 render().catch(show);
 </script>

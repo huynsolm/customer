@@ -45,11 +45,13 @@ def route(conn, method, path, body, query=None):
         if parts == ["api", "stores"]:
             return inv.list_stores(conn)
         if parts == ["api", "items"]:
-            return inv.list_items(conn, store_of(conn, query))
+            return inv.list_items(conn, store_of(conn, query), archived=query.get("archived") == ["1"])
         if parts == ["api", "pos"]:
             return inv.list_pos(conn, store_of(conn, query))
         if parts[:2] == ["api", "history"]:
             return inv.history(conn, int(parts[2]))
+        if parts[:2] == ["api", "item-changes"]:
+            return inv.item_changes(conn, int(parts[2]))
         if parts == ["api", "shortage"]:
             rows = inv.shortage_report(conn, store_id=store_of(conn, query))
             return {"rows": rows, "summary": summary.template_summary(rows)}
@@ -64,6 +66,10 @@ def route(conn, method, path, body, query=None):
             return {"id": inv.add_item(conn, body["name"], body["unit"], body.get("reorder_point", 0),
                                        body.get("opening", 0), body.get("key"),
                                        body.get("store_id", inv.DEFAULT_STORE), a)}
+        if parts == ["api", "stores", "rename"]:
+            return {"id": inv.update_store(conn, body["store_id"], body["name"])}
+        if parts == ["api", "items", "archive"]:
+            return {"id": inv.set_archived(conn, body["item_id"], body["archived"], a)}
         if parts == ["api", "items", "update"]:
             return {"id": inv.update_item(conn, body["item_id"], body["name"], body["reorder_point"], a)}
         if parts == ["api", "pos"]:

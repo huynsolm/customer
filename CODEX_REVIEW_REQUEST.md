@@ -1,53 +1,46 @@
-# 5차 검수 요청 (Codex)
+# 7차 검수 요청 (Codex)
 
-1~4차 검수 지적은 모두 반영되어 있다(README "검증 구분" 표 참고). 이번 변경은 그 위에 얹은 것이므로 **이번 변경분 중심으로** 봐 달라.
+1~6차 검수 지적은 모두 반영되어 있다(README "검증 구분" 표 참고). 5차 지적(AI 요약 응답의 매장 확인)도 반영·푸시됨(`6eb590b`). 이번 변경은 그 위에 얹은 것이므로 **이번 변경분 중심으로** 봐 달라.
 
-**5차 범위**: ① 4차 지적 3건의 수정이 제대로 됐는지(아래 "4차 수정 재확인"), ② 새로 추가한 **품목 수정** 기능, ③ 앞서 요청한 변경분(아래 표) 중 아직 못 본 부분.
-커밋 전 작업 트리 기준이다: `git diff` 와 새 파일 `test_stores.py`.
+**7차 범위**: 6차 지적 2건의 수정 확인(아래 표) + 보관·매장 이름 변경·수정 이력 변경분 전체. 이전 범위: `6eb590b`(푸시됨) 이후의 변경 — ① 품목 수정 이력(`item_changes`), ② **품목 보관·복원**, ③ **매장 이름 변경**. 앞선 변경은 이미 검수했으니 위 세 가지를 중심으로 봐 달라.
+작업 트리 기준이다(커밋 전): `git diff`로 `6eb590b` 이후 변경을 볼 수 있다.
 
 ## 이번 변경 요약
 | 변경 | 파일 |
 |---|---|
-| **품목 수정**(이름·발주 기준) — 5차 신규 | `inventory.update_item`, `POST /api/items/update`, `index.html`(수정 버튼) |
-| AI 요약을 Claude → ChatGPT(OpenAI Chat Completions, Structured Outputs) | `summary.py`, `test_summary.py`, `requirements.txt` |
-| 다중 매장(stores 테이블, items.store_id, 매장별 조회) | `inventory.py`, `server.py`, `index.html` |
-| 품목 추가(멱등) | `inventory.add_item`, `POST /api/items`, `index.html` |
-| 작업자 이름 기록(발주 등록·잔량 취소 포함) | `inventory.py`, `server.py`, `client.js`, `index.html` |
-| 이전 DB 자동 이전(마이그레이션), WAL 전환 재시도 | `inventory._migrate*`, `_enable_wal` |
-| 테스트 | `test_stores.py`(신규 12개), `test_summary.py`, `test_client.mjs`, `test_review2.py`(모킹 시그니처만) |
+| 품목 수정 이력 — 이름·발주 기준이 바뀔 때 이전·이후·작업자를 `item_changes`에 기록 | `inventory.update_item`, `item_changes`, `GET /api/item-changes/<id>`, `index.html` |
+| **품목 보관·복원**(삭제 대신 숨김, `items.archived`) | `inventory.set_archived`, `list_items(archived=)`, `_need_active_item`, `POST /api/items/archive`, `GET /api/items?archived=1`, `index.html` |
+| **매장 이름 변경** | `inventory.update_store`, `POST /api/stores/rename`, `index.html` |
+| DB 이전: `archived` 컬럼 추가(매장은 있고 보관은 없던 v0.3 DB 포함) | `inventory._needs_migration`, `_migrate_locked` |
+| 테스트 | `test_stores.py`(Archive 클래스·이름 변경·v0.3 이전·라우트 추가) — 전체 83개 |
 
 ## 실행
 ```bash
 python -m pip install -r requirements.txt   # openai (없어도 테스트 대부분 통과, RealSdk 테스트만 건너뜀)
-python -m unittest -v                        # 75개
+python -m unittest -v                        # 83개
 node --test test_client.mjs                  # 8개
 ```
 실제 OpenAI 서버는 호출하지 않는다(API 키 없음). `RealSdk` 테스트는 진짜 `openai` SDK + `httpx.MockTransport`.
 
-## 4차 수정 재확인 (지적 → 수정 → 확인 방법)
-| 4차 지적 | 수정 | 확인 |
+## 6차 수정 재확인
+| 6차 지적 | 수정 | 확인 |
 |---|---|---|
-| P1 매장 전환 중 지연 응답으로 다른 매장 품목에 기록 | `render()`가 시작 시 매장을 캡처하고 모든 조회에 전달, DOM 반영 전 `st !== store`이면 폐기. `vStock/vPo/vHist(st)` | 브라우저에서 `/api/items?store=1` 응답을 1.5초 지연 후 매장 전환 → 최종 화면에 강남점 행만 남음. 자동 테스트는 없음(JS 화면 로직) — **자동화할 수 있는 구조인지, 빠진 await 지점이 없는지** 봐 달라 |
-| P2 기초 재고 키 `opening-<id>` 충돌 500 | 키를 `"opening-" + uuid4().hex`로 변경 | `test_stores.test_opening_key_cannot_collide_with_user_keys` |
-| P2 없는 매장 조회가 200 빈 결과 | `store_of(conn, query)`가 `inv.need_store`(이전 `_need_store`)로 검증 → 400 | `test_stores.ServerRoutes.test_flow` (items·pos·shortage·shortage/ai) |
+| P1 보관 후 정정으로 재고가 생겨 품목이 숨겨진 채 남음 | `correct()`가 보관된 품목의 기록 정정을 거부(복원 후 가능) | `test_stores.Archive.test_correction_blocked_while_archived`(지적 재현 시나리오 그대로) |
+| P2 매장 전환 직후 이전 화면의 보관·복원 버튼으로 다른 매장 품목 변경 | 매장 전환·추가 시 `#view`를 즉시 비움(`loading()`) + 화면 안 모든 버튼을 `actIn(st, …)`로 감싸 그린 매장이 현재 매장일 때만 동작 | 브라우저에서 새 매장 조회를 지연시킨 채 옛 버튼 클릭 → 화면이 즉시 "불러오는 중…"이고 본점 품목은 그대로(다만 재고 있는 품목이라 서버도 거부하는 경우여서 이 확인만으로는 가드를 구분하지 못함 — **`actIn` 가드가 실제로 모든 핸들러를 덮는지 코드로 봐 달라**) |
 
 ## 특히 봐 줄 부분
-0. **품목 수정** (`inventory.update_item`, `index.html`의 수정 버튼): 같은 매장 안 이름 중복 검사(자기 자신 제외), 단위는 의도적으로 수정 불가, `items.request`(추가 요청 지문)를 수정 뒤에도 유지해 추가 요청 재전송이 처음 결과를 돌려주는 동작이 맞는지, 이름·발주 기준 수정이 이전 부족 판단·권장 발주량 계산에 일관되게 반영되는지, 프롬프트 취소·잘못된 숫자 입력 처리, 수정 이력이 남지 않는 점이 문제인지.
-1. **마이그레이션** (`inventory._migrate`, `_migrate_locked`)
-   - 이전 `items`는 `name UNIQUE`라 매장별 같은 이름을 쓰려고 테이블을 다시 만든다(CREATE → INSERT SELECT → DROP → RENAME, `PRAGMA foreign_keys=OFF`).
-   - 데이터 유실 가능성, 외래키가 새 `items`를 올바르게 가리키는지, 중간 실패 시 롤백, 연결이 동시에 열릴 때(`BEGIN IMMEDIATE` 후 재확인) 경쟁 상태.
-   - 이전 DB 픽스처는 `test_stores.py`의 `OLD_SCHEMA`(HEAD의 스키마를 옮긴 것). 실제 이전 버전 DB와 다른 점이 있는지.
-2. **매장 범위(scoping) 누락**: 매장 필터가 `list_items`, `list_pos`, `shortage_report`에만 있다. 품목 ID를 직접 받는 API(`/api/pos`, `/api/out`, `/api/history/<id>` 등)는 다른 매장 품목도 허용한다(의도: 화면이 선택 매장만 보여 줌). 이게 허용 가능한 설계인지, 다른 매장 품목으로 발주·사용 기록이 섞이는 경로가 있는지.
-3. **멱등성**: `add_item`·`add_store`의 요청 키 재생(같은 키·같은 내용 → 같은 결과, 다른 내용 → 거부). `items.request` 지문에 `store_id`가 포함되는지, 기초 재고 기록 키(`opening-<id>`)가 충돌하지 않는지.
-4. **서버 입력 검증**: `/api/items`의 `store_id`·이름 길이·타입, `?store=` 쿼리 파싱(`store_of`), URL에 쿼리가 붙은 정적 파일 요청(`urlsplit` 변경 영향).
-5. **작업자(actor)**: 클라이언트가 작업자 없이 요청을 만들지 않는지(`client.js`의 `createSender`), 작업자 이름이 재전송 키·지문에 영향을 주는지(의도: 영향 없음), XSS(`esc` 처리) 누락 여부.
-6. **AI 요약** (`summary.py`): `response_format` json_schema strict 사용이 맞는지, `finish_reason`·`refusal` 처리, 예외 계층(`AuthenticationError`/`RateLimitError`는 `APIStatusError` 하위) 순서, `max_completion_tokens=2000`이 추론 모델에서도 충분한지, 프롬프트 주입(품목 이름) 방어가 이전과 동일하게 유지되는지.
-7. **WAL 재시도** (`_enable_wal`): 100회×0.05초 재시도가 적절한지, 무한 대기·오류 은폐 위험.
-8. **화면** (`index.html`): 빈 매장(품목 0개)에서 이력·재고 화면 예외, 매장 전환 중 늦게 도착한 응답이 다른 매장 화면을 덮는 경우, `prompt()` 취소 처리.
+1. **보관 규칙** (`set_archived`): 재고 0·입고 예정 0일 때만 보관 가능. 이 검사가 트랜잭션 안에서 이뤄져 보관 직전에 끼어드는 입고·발주(동시 요청)를 막는지, `get_po`로 잔량을 보는 방식이 취소·정정된 발주에서도 맞는지.
+2. **보관된 품목이 새어 나가는 경로**: `create_po`·`stocktake`는 `_need_active_item`으로 막았다. 그 밖(`record_out`, `receive`, `correct`, `update_item`, `cancel_remaining`, 이력·수정 이력 조회)에서 보관 품목이 어떻게 동작하는지, 막아야 하는데 열려 있는 곳이 있는지. (의도: 재고가 0이고 입고 예정이 없으므로 사용·입고는 실질적으로 불가, 정정·수정·조회는 허용)
+3. **이름 유일성**: `UNIQUE(store_id, name)`이 보관된 품목도 포함한다(같은 이름의 새 품목은 만들 수 없고 복원하라는 메시지). 복원 시 중복 검사(`set_archived`의 복원 분기)가 사실상 방어용인데 필요한지·틀린 곳은 없는지.
+4. **DB 이전**: `archived` 컬럼을 `ALTER TABLE ... ADD COLUMN ... CHECK`로 추가하는 경로와, 이전 `items` 재구성 경로(CREATE TABLE에 `archived` 포함)가 모두 올바른지. 동시에 여러 연결이 열릴 때(`BEGIN IMMEDIATE` 재확인). `test_v03_db_without_archived_column`이 실제 v0.3 DB를 충분히 흉내 내는지.
+5. **수정 이력** (`item_changes`): `field` CHECK 제약에 `archived` 포함(이 테이블은 이번에 처음 만들어져 기존 DB에 영향 없음), 같은 값 재전송 시 이력이 안 남는지, 보관·복원 이력의 `old_value/new_value`("0"/"1") 표현.
+6. **매장 이름 변경** (`update_store`): 이름 중복(자기 자신 제외)·검증, 이력을 남기지 않는 것이 허용 가능한지, 이름이 바뀐 뒤 화면의 매장 선택기·저장된 선택값 동작.
+7. **화면** (`index.html`): 보관 `confirm`·복원 흐름, 보관 직후 목록 갱신, 보관된 품목이 변동 이력 화면의 품목 선택기에 없어 그 이력을 볼 수 없는 점(복원해야 보임 — 의도한 한계), 매장 전환 중 지연 응답 처리가 새 보관 조회(`Promise.all`)에도 유지되는지.
 
 ## 알려진 한계 (지적 불필요 — 의도한 범위)
 - 로그인·비밀번호 없음. 작업자는 입력한 이름을 그대로 기록(구분용, 보안 아님).
-- 품목 삭제, 매장 삭제·이름 변경, 매장 간 이동, 품목 수정 이력 없음(수정은 이름·발주 기준만).
+- 품목 완전 삭제(보관만 가능), 매장 삭제, 매장 이름 변경 이력, 매장 간 이동. 품목 수정은 이름·발주 기준만.
+- 보관된 품목의 변동 이력은 복원해야 화면에서 볼 수 있다(API로는 조회 가능).
 - 실제 OpenAI 서버 호출 미검증. 기본 모델명(`gpt-4o-mini`)은 임의 기본값이며 `OPENAI_MODEL`로 변경.
 - 가정한 업무 규칙(일주일분 발주 등)은 `virtual-interview.md` 기준이며 실제 운영자 확인 전.
 

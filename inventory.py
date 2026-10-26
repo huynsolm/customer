@@ -12,8 +12,16 @@ CREATE TABLE IF NOT EXISTS stores (
 CREATE TABLE IF NOT EXISTS items (
   id INTEGER PRIMARY KEY, store_id INTEGER NOT NULL DEFAULT 1 REFERENCES stores(id),
   name TEXT NOT NULL, unit TEXT NOT NULL,
-  reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT
+  reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT,
+  archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))
 );
+CREATE TABLE IF NOT EXISTS item_changes (
+  id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(id),
+  field TEXT NOT NULL CHECK (field IN ('name','reorder_point','archived')),
+  old_value TEXT NOT NULL, new_value TEXT NOT NULL, actor TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_item_changes_item ON item_changes(item_id);
 CREATE TABLE IF NOT EXISTS purchase_orders (
   id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(id),
   ordered_qty INTEGER NOT NULL CHECK (ordered_qty > 0),
@@ -87,7 +95,7 @@ def _columns(conn, table):
 def _needs_migration(conn):
     return ("request" not in _columns(conn, "stock_movements")
             or not {"created_by", "cancelled_by"} <= _columns(conn, "purchase_orders")
-            or "store_id" not in _columns(conn, "items")
+            or not {"store_id", "archived"} <= _columns(conn, "items")
             or not conn.execute("SELECT 1 FROM stores WHERE id=?", (DEFAULT_STORE,)).fetchone())
 
 
@@ -122,11 +130,14 @@ def _migrate_locked(conn):
         conn.execute("CREATE TABLE items_new (id INTEGER PRIMARY KEY,"
                      " store_id INTEGER NOT NULL DEFAULT 1 REFERENCES stores(id),"
                      " name TEXT NOT NULL, unit TEXT NOT NULL,"
-                     " reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT)")
+                     " reorder_point INTEGER NOT NULL DEFAULT 0, idempotency_key TEXT, request TEXT,"
+                     " archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)))")
         conn.execute("INSERT INTO items_new(id,store_id,name,unit,reorder_point)"
                      " SELECT id,?,name,unit,reorder_point FROM items", (DEFAULT_STORE,))
         conn.execute("DROP TABLE items")
         conn.execute("ALTER TABLE items_new RENAME TO items")
+    if "archived" not in _columns(conn, "items"):  # 매장 구분은 있고 보관 기능은 없던 버전
+        conn.execute("ALTER TABLE items ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))")
 
 
 @contextlib.contextmanager
@@ -245,6 +256,14 @@ def _need_item(conn, item_id):
         raise InventoryError("품목을 찾을 수 없습니다")
 
 
+def _need_active_item(conn, item_id):
+    row = conn.execute("SELECT archived FROM items WHERE id=?", (item_id,)).fetchone()
+    if not row:
+        raise InventoryError("품목을 찾을 수 없습니다")
+    if row["archived"]:
+        raise InventoryError("보관된 품목입니다. 복원한 뒤 사용하세요")
+
+
 def _insert(conn, **m):
     cur = conn.execute(
         "INSERT INTO stock_movements(item_id,po_id,kind,delta,corrects_id,idempotency_key,request,actor,note)"
@@ -284,6 +303,17 @@ def add_store(conn, name, key=None):
         return conn.execute("INSERT INTO stores(name,idempotency_key) VALUES(?,?)", (name, key)).lastrowid
 
 
+def update_store(conn, store_id, name):
+    """매장 이름 변경. 같은 값으로 다시 호출해도 결과가 같다."""
+    name = _clean_name(name, "매장 이름")
+    with tx(conn):
+        need_store(conn, store_id)
+        if conn.execute("SELECT 1 FROM stores WHERE name=? AND id<>?", (name, store_id)).fetchone():
+            raise InventoryError("같은 이름의 매장이 이미 있습니다")
+        conn.execute("UPDATE stores SET name=? WHERE id=?", (name, store_id))
+    return store_id
+
+
 def need_store(conn, store_id):
     _need_id(store_id, "매장")
     if not conn.execute("SELECT 1 FROM stores WHERE id=?", (store_id,)).fetchone():
@@ -310,7 +340,7 @@ def add_item(conn, name, unit, reorder_point=0, opening=0, key=None, store_id=DE
                 return done["id"]
         need_store(conn, store_id)
         if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=?", (store_id, name)).fetchone():
-            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다")
+            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다(보관된 품목이면 복원하세요)")
         item_id = conn.execute(
             "INSERT INTO items(store_id,name,unit,reorder_point,idempotency_key,request) VALUES(?,?,?,?,?,?)",
             (store_id, name, unit, reorder_point, key, request)).lastrowid
@@ -332,18 +362,56 @@ def update_item(conn, item_id, name, reorder_point, actor=""):
             raise InventoryError("품목을 찾을 수 없습니다")
         if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=? AND id<>?",
                         (item["store_id"], name, item_id)).fetchone():
-            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다")
+            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다(보관된 품목이면 복원하세요)")
         # items.request는 처음 추가 요청의 지문이라 그대로 둔다. 수정 뒤에 추가 요청이 재전송돼도 처음 결과를 돌려준다.
         conn.execute("UPDATE items SET name=?, reorder_point=? WHERE id=?", (name, reorder_point, item_id))
+        # 바뀐 항목만 이력에 남긴다(같은 값으로 다시 보내면 아무것도 남기지 않는다).
+        for field, old, new in (("name", item["name"], name), ("reorder_point", item["reorder_point"], reorder_point)):
+            if old != new:
+                conn.execute("INSERT INTO item_changes(item_id,field,old_value,new_value,actor) VALUES(?,?,?,?,?)",
+                             (item_id, field, str(old), str(new), actor))
     return item_id
 
 
-def list_items(conn, store_id=None):
-    """store_id가 None이면 모든 매장의 품목."""
+def set_archived(conn, item_id, archived, actor=""):
+    """품목 보관(삭제 대신 숨김)·복원. 이력은 그대로 남는다. 재고가 있거나 입고 예정이 남은 품목은 보관할 수 없다."""
+    _need_id(item_id, "품목")
+    if not isinstance(archived, bool):
+        raise InventoryError("보관 여부는 true 또는 false여야 합니다")
+    _need_text(actor, "작업자")
+    with tx(conn):
+        item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise InventoryError("품목을 찾을 수 없습니다")
+        if bool(item["archived"]) == archived:
+            return item_id  # 이미 그 상태(재전송·더블클릭)
+        if archived:
+            if _stock(conn, item_id):
+                raise InventoryError("재고가 남아 있어 보관할 수 없습니다(마감 실사로 0을 맞춘 뒤 보관하세요)")
+            for (po_id,) in conn.execute("SELECT id FROM purchase_orders WHERE item_id=?", (item_id,)).fetchall():
+                if get_po(conn, po_id)["remaining"]:
+                    raise InventoryError("입고 예정인 발주가 있어 보관할 수 없습니다(입고하거나 잔량을 취소하세요)")
+        else:
+            if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=? AND id<>? AND archived=0",
+                            (item["store_id"], item["name"], item_id)).fetchone():
+                raise InventoryError("같은 이름의 품목이 이미 있어 복원할 수 없습니다")
+        conn.execute("UPDATE items SET archived=? WHERE id=?", (int(archived), item_id))
+        conn.execute("INSERT INTO item_changes(item_id,field,old_value,new_value,actor) VALUES(?,?,?,?,?)",
+                     (item_id, "archived", str(int(not archived)), str(int(archived)), actor))
+    return item_id
+
+
+def item_changes(conn, item_id):
+    _need_id(item_id, "품목")
+    return [dict(r) for r in conn.execute("SELECT * FROM item_changes WHERE item_id=? ORDER BY id", (item_id,))]
+
+
+def list_items(conn, store_id=None, archived=False):
+    """store_id가 None이면 모든 매장의 품목. 기본은 사용 중인 품목, archived=True면 보관된 품목만."""
     rows = conn.execute(
         "SELECT i.id, i.store_id, i.name, i.unit, i.reorder_point, COALESCE(SUM(m.delta),0) AS stock FROM items i"
-        " LEFT JOIN stock_movements m ON m.item_id=i.id WHERE (?1 IS NULL OR i.store_id=?1)"
-        " GROUP BY i.id ORDER BY i.id", (store_id,)
+        " LEFT JOIN stock_movements m ON m.item_id=i.id WHERE (?1 IS NULL OR i.store_id=?1) AND i.archived=?2"
+        " GROUP BY i.id ORDER BY i.id", (store_id, int(archived))
     ).fetchall()
     return [dict(r, low=r["stock"] <= r["reorder_point"]) for r in rows]
 
@@ -433,7 +501,7 @@ def create_po(conn, item_id, qty, key=None, actor=""):
                 if (done["item_id"], done["ordered_qty"]) != (item_id, qty):
                     raise InventoryError("같은 요청 키로 다른 발주가 이미 등록되어 있습니다")
                 return done["id"]
-        _need_item(conn, item_id)
+        _need_active_item(conn, item_id)
         return conn.execute(
             "INSERT INTO purchase_orders(item_id,ordered_qty,idempotency_key,created_by) VALUES(?,?,?,?)",
             (item_id, qty, key, actor),
@@ -506,7 +574,7 @@ def stocktake(conn, item_id, counted, key, actor="", note=""):
         done = _replay(conn, key, request)
         if done:
             return done["id"]
-        _need_item(conn, item_id)
+        _need_active_item(conn, item_id)
         diff = counted - _stock(conn, item_id)
         return _insert(conn, item_id=item_id, kind="adjustment", delta=diff, key=key, request=request,
                        actor=actor, note=note or "마감 실사(차이 %+d)" % diff)
@@ -528,6 +596,9 @@ def correct(conn, movement_id, new_qty, key, reason, actor=""):
         m = conn.execute("SELECT * FROM stock_movements WHERE id=?", (movement_id,)).fetchone()
         if not m or m["kind"] in ("correction", "adjustment"):
             raise InventoryError("정정할 수 없는 기록입니다")
+        # 보관 조건(재고 0·입고 예정 0)을 보관된 동안에도 지킨다. 정정은 재고를 바꾸므로 복원한 뒤에만 한다.
+        if conn.execute("SELECT archived FROM items WHERE id=?", (m["item_id"],)).fetchone()["archived"]:
+            raise InventoryError("보관된 품목의 기록은 정정할 수 없습니다. 복원한 뒤 정정하세요")
         # 마감 실사가 이미 실물에 맞춰 차이를 조정했으므로, 그 이전 기록을 정정하면 차이가 두 번 반영된다.
         if conn.execute("SELECT 1 FROM stock_movements WHERE item_id=? AND kind='adjustment' AND id>?",
                         (m["item_id"], movement_id)).fetchone():

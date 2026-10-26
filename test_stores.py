@@ -71,6 +71,17 @@ class AddItem(unittest.TestCase):
                 inv.update_item(self.conn, *args)
         self.assertEqual(inv.update_item(self.conn, b, "소금", 3), b)  # 자기 이름은 허용
 
+    def test_update_leaves_change_history(self):
+        a = inv.add_item(self.conn, "설탕", "kg", 2)
+        inv.update_item(self.conn, a, "백설탕", 2, "민수")   # 이름만
+        inv.update_item(self.conn, a, "백설탕", 2, "민수")   # 같은 값 재전송 → 이력 없음
+        inv.update_item(self.conn, a, "백설탕", 5, "지아")   # 발주 기준만
+        got = [(c["field"], c["old_value"], c["new_value"], c["actor"]) for c in inv.item_changes(self.conn, a)]
+        self.assertEqual(got, [("name", "설탕", "백설탕", "민수"), ("reorder_point", "2", "5", "지아")])
+        with self.assertRaises(inv.InventoryError):
+            inv.update_item(self.conn, a, "백설탕", 1.5, "민수")  # 실패한 수정은 이력을 남기지 않는다
+        self.assertEqual(len(inv.item_changes(self.conn, a)), 2)
+
     def test_update_name_unique_only_within_store(self):
         s2 = inv.add_store(self.conn, "강남점")
         a = inv.add_item(self.conn, "설탕", "kg")
@@ -85,6 +96,64 @@ class AddItem(unittest.TestCase):
             with self.assertRaises(inv.InventoryError, msg=kw):
                 inv.add_item(self.conn, **args)
         self.assertEqual(inv.list_items(self.conn), [])
+
+
+class Archive(unittest.TestCase):
+    def setUp(self):
+        self.conn = inv.connect()
+        self.a = inv.add_item(self.conn, "설탕", "kg", 2, 0)
+
+    def names(self, archived=False):
+        return [i["name"] for i in inv.list_items(self.conn, archived=archived)]
+
+    def test_archive_hides_item_but_keeps_history(self):
+        inv.set_archived(self.conn, self.a, True, "민수")
+        self.assertEqual((self.names(), self.names(True)), ([], ["설탕"]))
+        self.assertEqual(inv.shortage_report(self.conn), [])  # 부족 계산에서도 빠진다
+        inv.set_archived(self.conn, self.a, True, "민수")     # 더블클릭·재전송 → 이력 한 번만
+        inv.set_archived(self.conn, self.a, False, "지아")
+        self.assertEqual(self.names(), ["설탕"])
+        got = [(c["field"], c["old_value"], c["new_value"], c["actor"]) for c in inv.item_changes(self.conn, self.a)]
+        self.assertEqual(got, [("archived", "0", "1", "민수"), ("archived", "1", "0", "지아")])
+
+    def test_cannot_archive_with_stock_or_incoming(self):
+        inv.stocktake(self.conn, self.a, 3, "c1")
+        with self.assertRaisesRegex(inv.InventoryError, "재고"):
+            inv.set_archived(self.conn, self.a, True)
+        inv.stocktake(self.conn, self.a, 0, "c2")
+        po = inv.create_po(self.conn, self.a, 5)
+        with self.assertRaisesRegex(inv.InventoryError, "입고 예정"):
+            inv.set_archived(self.conn, self.a, True)
+        inv.cancel_remaining(self.conn, po, "취소")
+        inv.set_archived(self.conn, self.a, True)  # 잔량을 취소하면 보관할 수 있다
+        self.assertEqual(self.names(), [])
+
+    def test_archived_item_rejects_new_work_and_name_reuse(self):
+        inv.set_archived(self.conn, self.a, True)
+        with self.assertRaisesRegex(inv.InventoryError, "보관"):
+            inv.create_po(self.conn, self.a, 5)
+        with self.assertRaisesRegex(inv.InventoryError, "보관"):
+            inv.stocktake(self.conn, self.a, 1, "c")
+        with self.assertRaisesRegex(inv.InventoryError, "복원"):
+            inv.add_item(self.conn, "설탕", "kg")
+        self.assertEqual(inv.history(self.conn, self.a), [])
+
+    def test_correction_blocked_while_archived(self):
+        """6차 #1: 보관 뒤 정정으로 재고가 생기면 재고 있는 품목이 숨겨졌다."""
+        item = inv.add_item(self.conn, "우유", "개", opening=5)
+        used = inv.record_out(self.conn, item, 5, "use", "u", "민수")
+        inv.set_archived(self.conn, item, True, "민수")
+        with self.assertRaisesRegex(inv.InventoryError, "보관"):
+            inv.correct(self.conn, used, 4, "fix", "수량 정정", "지아")
+        self.assertEqual(inv.current_stock(self.conn, item), 0)
+        inv.set_archived(self.conn, item, False, "민수")
+        inv.correct(self.conn, used, 4, "fix", "수량 정정", "지아")  # 복원하면 정정할 수 있다
+        self.assertEqual([i["stock"] for i in inv.list_items(self.conn) if i["id"] == item], [1])
+
+    def test_bad_input(self):
+        for args in ((self.a, "true"), (self.a, 1), (self.a, None), (999, True), (True, True)):
+            with self.assertRaises(inv.InventoryError, msg=args):
+                inv.set_archived(self.conn, *args)
 
 
 class Stores(unittest.TestCase):
@@ -121,6 +190,15 @@ class Stores(unittest.TestCase):
         with self.assertRaises(inv.InventoryError):
             inv.add_store(self.conn, "신촌점", "sk")
 
+    def test_rename_store(self):
+        self.assertEqual(inv.update_store(self.conn, self.b, " 역삼점 "), self.b)
+        self.assertEqual(inv.update_store(self.conn, self.b, "역삼점"), self.b)  # 재전송
+        self.assertEqual([s["name"] for s in inv.list_stores(self.conn)], ["본점", "역삼점"])
+        for args in ((self.b, "본점"), (self.b, ""), (self.b, None), (99, "x"), (True, "x")):
+            with self.assertRaises(inv.InventoryError, msg=args):
+                inv.update_store(self.conn, *args)
+        self.assertEqual(inv.update_store(self.conn, self.b, "역삼점"), self.b)  # 자기 이름은 허용
+
     def test_cancel_records_actor(self):
         po = inv.create_po(self.conn, self.milk1, 10)
         inv.cancel_remaining(self.conn, po, "결품", "지아")
@@ -154,6 +232,20 @@ class Migration(unittest.TestCase):
         self.assertEqual(inv.receive(c, 1, 4, "r2"), inv.receive(c, 1, 4, "r2"))
         c.close()
         inv.connect(path).close()  # 두 번째 열기는 아무것도 바꾸지 않는다
+
+    def test_v03_db_without_archived_column(self):
+        """보관 기능 이전 버전(매장은 있고 archived 컬럼이 없음)도 데이터를 지키며 올라간다."""
+        path = os.path.join(tempfile.mkdtemp(), "v03.db")
+        c = inv.connect(path)
+        milk = inv.add_item(c, "우유", "개", 5, 3)
+        c.execute("ALTER TABLE items DROP COLUMN archived")
+        c.close()
+        c = inv.connect(path)
+        self.assertEqual([(i["name"], i["stock"]) for i in inv.list_items(c)], [("우유", 3)])
+        inv.record_out(c, milk, 3, "use", "u")  # 재고를 0으로 만든 뒤
+        inv.set_archived(c, milk, True)
+        self.assertEqual(inv.list_items(c), [])
+        c.close()
 
     def test_concurrent_open_of_old_db(self):
         path = self.old_db()
@@ -221,9 +313,20 @@ class ServerRoutes(unittest.TestCase):
                      "/api/shortage?store=999"):  # 4차 #3: 없는 매장은 빈 매장이 아니라 오류
             self.assertEqual(self.call(path)[0], 400, path)
         self.assertEqual(self.call("/api/items/update", {"item_id": made["id"], "name": "우유2", "reorder_point": 4, "actor": "지아"})[0], 200)
+        self.assertEqual([(c["field"], c["actor"]) for c in self.call("/api/item-changes/%d" % made["id"])[1]],
+                         [("name", "지아"), ("reorder_point", "지아")])
         self.assertEqual(self.call("/api/items/update", {"item_id": made["id"], "name": "", "reorder_point": 4})[0], 400)
         self.assertEqual(self.call("/api/items/update", {"item_id": made["id"]})[0], 400)
         self.assertEqual(self.call("/api/items?store=%d" % b["id"])[1][0]["name"], "우유2")
+        sugar = self.call("/api/items", {"store_id": b["id"], "name": "설탕", "unit": "kg", "key": "i2", "actor": "민수"})[1]["id"]
+        arch = {"item_id": sugar, "archived": True, "actor": "민수"}
+        self.assertEqual(self.call("/api/items/archive", arch)[0], 200)
+        self.assertEqual(self.call("/api/items/archive", arch)[0], 200)  # 더블클릭
+        self.assertEqual(self.call("/api/items/archive", {"item_id": sugar, "archived": "yes"})[0], 400)
+        self.assertEqual([i["name"] for i in self.call("/api/items?archived=1&store=%d" % b["id"])[1]], ["설탕"])
+        self.assertNotIn("설탕", [i["name"] for i in self.call("/api/items?store=%d" % b["id"])[1]])
+        self.assertEqual(self.call("/api/stores/rename", {"store_id": b["id"], "name": "역삼점"})[0], 200)
+        self.assertEqual(self.call("/api/stores/rename", {"store_id": b["id"], "name": "본점"})[0], 400)
         self.assertEqual(self.call("/api/shortage/ai?store=999", {})[0], 400)
         self.assertEqual(self.call("/api/items", {"unit": "개", "key": "z"})[0], 400)  # 이름 없음
         self.assertEqual(self.call("/api/items", {"name": "빈", "unit": "개", "store_id": 77})[0], 400)

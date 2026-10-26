@@ -2,14 +2,14 @@
 id: happicare-comparison
 title: HappiCare 두 가지 바이브코딩 방식 비교
 sidebar_label: HappiCare 방식 비교
-description: happicare(React 전환)와 happicare_front2(통합 문의 관리 시스템)를 기획자·웹퍼블리셔·개발자 관점에서 비교한 팀 공유 자료
-tags: [happicare, 바이브코딩, react, nestjs, 팀공유]
+description: happicare, happicare_admin_version2, happicare_front2 세 저장소(와 빈 저장소 happicare_admin)를 기획자·웹퍼블리셔·개발자 관점에서 비교한 팀 공유 자료
+tags: [happicare, 바이브코딩, react, msw, nestjs, 팀공유]
 ---
 
 # HappiCare 두 가지 바이브코딩 방식 비교
 
-> 같은 HappiCare 문의 서비스를 **서로 다른 방식**으로 AI와 함께 만든 두 저장소를 비교합니다.
-> 기준 시점은 2026-10-25이며, 각 저장소의 기본 브랜치를 읽고 정리했습니다. 앱을 직접 실행하거나 빌드해 보지는 않았습니다.
+> 같은 HappiCare 문의 서비스를 **서로 다른 방식**으로 AI와 함께 만든 저장소들을 비교합니다. 본문의 1~7장은 `happicare`와 `happicare_front2`를 비교하고, 8장에서 관리자 프로토타입 `happicare_admin_version2`를 더해 세 단계로 정리합니다.
+> 기준 시점은 2026-10-26이며, 각 저장소의 기본 브랜치를 읽고 정리했습니다. 앱을 직접 실행하거나 빌드해 보지는 않았습니다.
 
 ## 1. 한 장 요약
 
@@ -182,7 +182,82 @@ tags: [happicare, 바이브코딩, react, nestjs, 팀공유]
 - **퍼블리싱**: 브랜드 원본 색 확정(D1), 병원 화면 시안 보강.
 - **개발**: 두 저장소를 합칠지 별도로 유지할지, 웹을 TypeScript로 옮길지.
 
-## 8. 참고 위치
+## 8. 관리자 프로토타입 `happicare_admin_version2` 추가
+
+### 8.1 저장소 4개의 관계
+
+| 저장소 | 상태 | 역할 |
+|---|---|---|
+| `happicare_admin` | 거의 비어 있음(README 한 줄, 커밋 1개, 2026-09-04) | `happicare_admin_version2`를 만들기 전의 빈 시작 저장소로 보임 |
+| `happicare` | React 전환 프로토타입 | 고객 화면 |
+| `happicare_admin_version2` | 관리자 화면 프론트 | MSW mock, 실제 API로 전환 준비 완료 |
+| `happicare_front2` | 풀스택 | 병원 화면 + 관리자 화면 + NestJS + DB + 배포 |
+
+:::note 해석 주의
+`happicare_admin_version2`와 `happicare_front2`는 같은 관리자 화면 명세(공지 Tiptap 에디터, 담당자 관리, 자주 쓰는 답변 등)를 다룹니다. 시기도 앞서므로(2026-09-06~09-20 대 2026-09-30~10-11) 프로토타입에서 풀스택으로 발전한 것으로 보입니다. 다만 두 저장소 사이에 코드를 가져온 흔적은 확인하지 못했으므로, 실제 관계는 작성자에게 확인이 필요합니다.
+:::
+
+### 8.2 `happicare_admin_version2`는 무엇인가
+
+- 해피케어 CRM **관리자용 문의 관리 프론트엔드**입니다. React 19 + Vite 8, JavaScript/JSX이고 백엔드는 없습니다.
+- 규모는 파일 약 230개, JS/JSX 약 4천 줄, 커밋 8개(2026-09-06~09-20)입니다.
+- 구현된 화면은 다음과 같습니다.
+  - 문의 목록(필터, 정렬, 페이지네이션, 검색 조건 URL 보존)
+  - 유형별 문의 상세 5종(일반, 알림톡, 신규 프로모션, 신규 예약, 발송그룹)
+  - 담당자 지정과 `확인전 → 확인중 → 답변완료` 상태 전이
+  - 내부 메모, 자주 쓰는 답변(드래그 정렬), XLSX 다운로드
+  - 공지사항 등록·수정·삭제, 담당자 관리
+- 기술 스택은 TanStack Query, React Hook Form + Zod, React Router 7, Tiptap, dnd-kit, Vitest, Playwright입니다.
+
+### 8.3 핵심 아이디어: MSW로 서버 없이 실제 HTTP처럼
+
+백엔드가 없어도 화면 코드는 mock 함수가 아니라 **실제 `/api/*` HTTP 요청**을 보냅니다. MSW(Mock Service Worker)가 요청을 가로채 `localStorage`에 저장합니다.
+
+| 설정 | 동작 |
+|---|---|
+| 기본값(`VITE_USE_MOCKS=true`) | MSW가 요청을 가로채 가짜 서버처럼 응답 |
+| `VITE_USE_MOCKS=false` + `VITE_API_BASE_URL` | 화면 수정 없이 실제 백엔드로 전환 |
+| `?mockDelay=1500` | 응답을 1.5초 지연(로딩 화면 확인) |
+| `?mockStatus=500` | 모든 요청을 지정 상태(400, 403, 404, 409, 422, 500)로 실패시켜 오류 화면 확인 |
+
+강제 오류는 저장 전에 반환되므로 데이터가 바뀌지 않습니다. 인증, 파일 업로드 저장소, 알림, 계정 동기화는 의도적으로 mock으로 남겨 두었습니다.
+
+### 8.4 함께 둔 자료
+
+| 자료 | 위치 | 대상 |
+|---|---|---|
+| 정적 HTML 데모 | `static-html/` | 기획자·팀원이 React 환경 없이 `index.html`만 열어 흐름 확인 |
+| 화면별 설계 기록 | `docs/design-log/` | 디자이너·기획자 관점의 구현 기록(문의 목록, 상세, 공지, 담당자 등) |
+| 백엔드 인계 문서 | `docs/backend-handoff.md` | 백엔드 개발자가 구현할 endpoint와 응답 계약 |
+| 10분 발표 대본 | `docs/presentation/` | 팀 발표용 |
+| 작업 인계 문서 | `CONTINUE_HERE.md` | 다른 PC의 AI가 작업을 이어받기 위한 문서 |
+
+`CONTINUE_HERE.md`에는 기록을 team-library에 옮길 마크다운 형식으로 관리한다고 적혀 있습니다.
+
+### 8.5 세 단계 비교
+
+| 항목 | `happicare` | `happicare_admin_version2` | `happicare_front2` |
+|---|---|---|---|
+| 대상 화면 | 고객 | 관리자 | 병원 + 관리자 |
+| 데이터 | `sessionStorage` | MSW + `localStorage` | MariaDB + Prisma |
+| 백엔드 | 없음 | 없음(HTTP 계약만 정의) | NestJS |
+| 서버 전환 방식 | 데이터 소스 교체 | 환경변수 하나로 전환 | 해당 없음(이미 서버) |
+| 기획자용 산출물 | 발표 대본, 팀 보고서 | 정적 HTML 데모, 설계 기록 | Concept·Design·ToDo, 시안 |
+| 작업 기록 | 학습 가이드 | design-log + 인계 문서 | phase별 설계서·계획서 |
+| 기간 | 2026-08-25~10-13 | 2026-09-06~09-20 | 2026-09-30~10-11 |
+
+### 8.6 직군별 추가 포인트
+
+- **기획자:** 정적 HTML 데모(`static-html/`)는 설치 없이 브라우저에서 열 수 있어 기획 검토나 내부 시연에 바로 쓸 수 있습니다.
+- **웹퍼블리셔:** `docs/design-log/`에 화면마다 외관 기록이 있어 디자인 의도를 추적하기 좋습니다. `?mockDelay`와 `?mockStatus`로 로딩·오류 상태 화면을 직접 확인할 수 있습니다.
+- **개발자:** MSW 방식은 프론트와 백엔드를 병렬로 개발하게 해 줍니다. `docs/backend-handoff.md`의 계약이 곧 백엔드 구현 기준입니다. 같은 화면이 `happicare_front2`에도 있으므로 중복 구현 여부를 정리해야 합니다.
+
+### 8.7 추가로 팀에 요청할 결정
+
+- `happicare_admin_version2`와 `happicare_front2`의 관리자 화면 중 어느 쪽을 기준으로 삼을지
+- 빈 저장소 `happicare_admin`을 보관할지 삭제할지
+
+## 9. 참고 위치
 
 | 자료 | 위치 |
 |---|---|
@@ -195,3 +270,6 @@ tags: [happicare, 바이브코딩, react, nestjs, 팀공유]
 | API 계약 초안 | `happicare/docs/API_CONTRACT.md` |
 | 원본 대응표 | `happicare/docs/inquiry-original-mapping.md` |
 | 기존 팀 보고서 | `happicare/docs/happicare-migration-team-report.md` |
+| 관리자 프로토타입 개요 | `happicare_admin_version2/README.md`, `CONTINUE_HERE.md` |
+| 백엔드 인계 | `happicare_admin_version2/docs/backend-handoff.md` |
+| 정적 HTML 데모 | `happicare_admin_version2/static-html/` |

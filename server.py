@@ -23,10 +23,12 @@ SEED = [("우유", "개", 5, 3), ("원두", "kg", 2, 4), ("컵(12oz)", "개", 50
 
 
 def seed():
+    """샘플 품목은 DB가 처음 만들어졌을 때 한 번만 넣는다(자세한 규칙은 inventory.seed_once)."""
     c = inv.connect(DB)
-    if not c.execute("SELECT 1 FROM items").fetchone():
-        for n, u, r, o in SEED:
-            inv.add_item(c, n, u, r, o)
+    try:
+        inv.seed_once(c, SEED)
+    finally:
+        c.close()
 
 
 def store_of(conn, query):
@@ -68,6 +70,8 @@ def route(conn, method, path, body, query=None):
                                        body.get("store_id", inv.DEFAULT_STORE), a)}
         if parts == ["api", "stores", "rename"]:
             return {"id": inv.update_store(conn, body["store_id"], body["name"])}
+        if parts == ["api", "items", "delete"]:
+            return {"id": inv.delete_item(conn, body["item_id"], body["key"], a)}
         if parts == ["api", "items", "archive"]:
             return {"id": inv.set_archived(conn, body["item_id"], body["archived"], a)}
         if parts == ["api", "items", "update"]:

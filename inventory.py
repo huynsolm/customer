@@ -6,6 +6,7 @@ import time
 import uuid
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS stores (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, idempotency_key TEXT
 );
@@ -22,6 +23,14 @@ CREATE TABLE IF NOT EXISTS item_changes (
   created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_item_changes_item ON item_changes(item_id);
+CREATE TABLE IF NOT EXISTS item_deletions (
+  id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL, store_id INTEGER NOT NULL,
+  name TEXT NOT NULL, unit TEXT NOT NULL, opening_qty INTEGER NOT NULL,
+  actor TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL UNIQUE,
+  add_key TEXT, add_request TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_item_deletions_add_key ON item_deletions(add_key);
 CREATE TABLE IF NOT EXISTS purchase_orders (
   id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(id),
   ordered_qty INTEGER NOT NULL CHECK (ordered_qty > 0),
@@ -329,25 +338,59 @@ def add_item(conn, name, unit, reorder_point=0, opening=0, key=None, store_id=DE
     _need_text(actor, "작업자")
     if key is not None:
         _need_key(key)
+    with tx(conn):
+        return _add_item_locked(conn, name, unit, reorder_point, opening, key, store_id, actor)
+
+
+def _add_item_locked(conn, name, unit, reorder_point, opening, key, store_id, actor):
+    """add_item의 본문. 호출하는 쪽이 이미 쓰기 트랜잭션(tx)을 열어 둔 상태여야 하고, 입력은 검증된 값이다."""
     request = _request(op="add_item", store_id=store_id, name=name, unit=unit,
                        reorder_point=reorder_point, opening=opening)
-    with tx(conn):
-        if key is not None:
-            done = conn.execute("SELECT * FROM items WHERE idempotency_key=?", (key,)).fetchone()
-            if done:
-                if done["request"] != request:
-                    raise InventoryError("같은 요청 키로 다른 품목이 이미 등록되어 있습니다")
-                return done["id"]
-        need_store(conn, store_id)
-        if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=?", (store_id, name)).fetchone():
-            raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다(보관된 품목이면 복원하세요)")
-        item_id = conn.execute(
-            "INSERT INTO items(store_id,name,unit,reorder_point,idempotency_key,request) VALUES(?,?,?,?,?,?)",
-            (store_id, name, unit, reorder_point, key, request)).lastrowid
-        if opening:
-            _insert(conn, item_id=item_id, kind="opening", delta=opening, key="opening-" + uuid.uuid4().hex,  # 사용자가 쓴 요청 키와 겹치지 않게 내부에서 만든다
-                    request=_request(op="opening", item_id=item_id, qty=opening), actor=actor, note="기초 재고")
+    if key is not None:
+        done = conn.execute("SELECT * FROM items WHERE idempotency_key=?", (key,)).fetchone()
+        if done:
+            if done["request"] != request:
+                raise InventoryError("같은 요청 키로 다른 품목이 이미 등록되어 있습니다")
+            return done["id"]
+        # 그 요청으로 만든 품목이 나중에 삭제됐으면, 재전송이 삭제를 되돌리듯 품목을 다시 만들면 안 된다.
+        gone = conn.execute("SELECT * FROM item_deletions WHERE add_key=?", (key,)).fetchone()
+        if gone:
+            if gone["add_request"] != request:
+                raise InventoryError("같은 요청 키로 다른 품목이 이미 등록되어 있습니다")
+            return gone["item_id"]
+    need_store(conn, store_id)
+    if conn.execute("SELECT 1 FROM items WHERE store_id=? AND name=?", (store_id, name)).fetchone():
+        raise InventoryError("이 매장에 같은 이름의 품목이 이미 있습니다(보관된 품목이면 복원하세요)")
+    # 품목 번호는 지운 뒤에도 다시 쓰지 않는다(SQLite는 마지막 번호를 지우면 재사용한다). 삭제 전 품목을
+    # 가리키던 오래된 요청이 같은 번호의 새 품목에 적용되지 않게, 지운 품목 번호까지 포함해 다음 번호를 정한다.
+    item_id = conn.execute(
+        "SELECT MAX(COALESCE((SELECT MAX(id) FROM items),0), COALESCE((SELECT MAX(item_id) FROM item_deletions),0)) + 1"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO items(id,store_id,name,unit,reorder_point,idempotency_key,request) VALUES(?,?,?,?,?,?,?)",
+        (item_id, store_id, name, unit, reorder_point, key, request))
+    if opening:
+        _insert(conn, item_id=item_id, kind="opening", delta=opening, key="opening-" + uuid.uuid4().hex,  # 사용자가 쓴 요청 키와 겹치지 않게 내부에서 만든다
+                request=_request(op="opening", item_id=item_id, qty=opening), actor=actor, note="기초 재고")
     return item_id
+
+
+def seed_once(conn, samples, flag="seeded"):
+    """샘플 품목을 DB가 처음 만들어질 때 한 번만 넣는다. 확인·품목 추가·완료 표시가 한 트랜잭션이라
+    중간에 실패하면 아무것도 남지 않고(다음 시작에 다시 시도), 동시에 시작한 서버는 한쪽만 넣는다.
+    이미 품목이나 삭제 기록이 있는 DB는 샘플 없이 완료로만 표시한다. samples: (이름, 단위, 발주 기준, 기초 재고)."""
+    clean = [(_clean_name(n, "품목 이름"), _clean_name(u, "단위"), r, o) for n, u, r, o in samples]
+    for _, _, r, o in clean:
+        _need_int(r, 0, "발주 기준")
+        _need_int(o, 0, "기초 재고")
+    with tx(conn):
+        if conn.execute("SELECT 1 FROM meta WHERE key=?", (flag,)).fetchone():
+            return False
+        if not conn.execute("SELECT 1 FROM items UNION ALL SELECT 1 FROM item_deletions").fetchone():
+            for n, u, r, o in clean:
+                _add_item_locked(conn, n, u, r, o, None, DEFAULT_STORE, "")
+        conn.execute("INSERT INTO meta(key,value) VALUES(?, '1')", (flag,))
+        return True
 
 
 def update_item(conn, item_id, name, reorder_point, actor=""):
@@ -398,6 +441,39 @@ def set_archived(conn, item_id, archived, actor=""):
         conn.execute("UPDATE items SET archived=? WHERE id=?", (int(archived), item_id))
         conn.execute("INSERT INTO item_changes(item_id,field,old_value,new_value,actor) VALUES(?,?,?,?,?)",
                      (item_id, "archived", str(int(not archived)), str(int(archived)), actor))
+    return item_id
+
+
+def delete_item(conn, item_id, key, actor=""):
+    """품목 완전 삭제. 기록을 지우지 않는 원칙이 있으므로, 입고·사용·폐기·마감·정정·발주 기록이 없는
+    (기초 재고만 있는) 품목 = 실수로 만든 품목만 지울 수 있다. 그 밖에는 보관을 쓴다.
+    삭제 사실은 item_deletions에 남긴다. 같은 key로 다시 호출하면(더블클릭·재전송) 처음 결과를 돌려준다.
+    품목 번호는 지운 뒤에도 다시 쓰이지 않는다(add_item이 지운 번호보다 큰 번호만 준다). 재전송은 key로 알아본다."""
+    _need_id(item_id, "품목")
+    _need_key(key)
+    _need_text(actor, "작업자")
+    with tx(conn):
+        done = conn.execute("SELECT * FROM item_deletions WHERE idempotency_key=?", (key,)).fetchone()
+        if done:
+            if done["item_id"] != item_id:
+                raise InventoryError("같은 요청 키로 다른 품목 삭제가 이미 처리되었습니다")
+            return item_id
+        item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+        if not item:
+            raise InventoryError("품목을 찾을 수 없습니다")
+        if conn.execute("SELECT 1 FROM purchase_orders WHERE item_id=?", (item_id,)).fetchone():
+            raise InventoryError("발주 기록이 있어 삭제할 수 없습니다. 보관을 사용하세요")
+        moves = conn.execute("SELECT kind, delta FROM stock_movements WHERE item_id=?", (item_id,)).fetchall()
+        if any(m["kind"] != "opening" for m in moves):
+            raise InventoryError("입고·사용·폐기·마감·정정 기록이 있어 삭제할 수 없습니다. 보관을 사용하세요")
+        # 삭제된 품목을 만든 추가 요청의 키·지문을 남겨, 그 요청이 나중에 재전송돼도 품목이 되살아나지 않게 한다.
+        conn.execute("INSERT INTO item_deletions(item_id,store_id,name,unit,opening_qty,actor,idempotency_key,add_key,add_request)"
+                     " VALUES(?,?,?,?,?,?,?,?,?)",
+                     (item_id, item["store_id"], item["name"], item["unit"], sum(m["delta"] for m in moves), actor, key,
+                      item["idempotency_key"], item["request"]))
+        conn.execute("DELETE FROM item_changes WHERE item_id=?", (item_id,))
+        conn.execute("DELETE FROM stock_movements WHERE item_id=?", (item_id,))
+        conn.execute("DELETE FROM items WHERE id=?", (item_id,))
     return item_id
 
 

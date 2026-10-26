@@ -156,6 +156,199 @@ class Archive(unittest.TestCase):
                 inv.set_archived(self.conn, *args)
 
 
+class DeleteItem(unittest.TestCase):
+    def setUp(self):
+        self.conn = inv.connect()
+
+    def count(self, table):
+        return self.conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+
+    def test_delete_mistaken_item(self):
+        a = inv.add_item(self.conn, "오타품목", "개", 2, 5, actor="민수")
+        b = inv.add_item(self.conn, "우유", "개", 5, 3)
+        self.assertEqual(inv.delete_item(self.conn, a, "d1", "지아"), a)
+        self.assertEqual([i["name"] for i in inv.list_items(self.conn)], ["우유"])
+        self.assertEqual(inv.history(self.conn, a), [])
+        self.assertEqual(inv.item_changes(self.conn, a), [])
+        log = dict(self.conn.execute("SELECT * FROM item_deletions").fetchone())
+        self.assertEqual((log["item_id"], log["name"], log["opening_qty"], log["actor"]), (a, "오타품목", 5, "지아"))
+        inv.add_item(self.conn, "오타품목", "개")  # 같은 이름을 다시 쓸 수 있다
+        self.assertEqual(inv.current_stock(self.conn, b), 3)
+
+    def test_archived_item_can_be_deleted_too(self):
+        a = inv.add_item(self.conn, "설탕", "kg")
+        inv.set_archived(self.conn, a, True, "민수")
+        inv.delete_item(self.conn, a, "d1")
+        self.assertEqual((inv.list_items(self.conn, archived=True), inv.list_items(self.conn)), ([], []))
+
+    def test_items_with_history_cannot_be_deleted(self):
+        def fresh(name):
+            return inv.add_item(self.conn, name, "개", 0, 10)
+        used = fresh("사용")
+        inv.record_out(self.conn, used, 1, "use", "u")
+        counted = fresh("마감")
+        inv.stocktake(self.conn, counted, 10, "s")
+        ordered = fresh("발주")
+        inv.create_po(self.conn, ordered, 5)
+        corrected = fresh("정정")
+        inv.correct(self.conn, inv.history(self.conn, corrected)[0]["id"], 8, "c", "오입력")
+        for item in (used, counted, ordered, corrected):
+            with self.assertRaisesRegex(inv.InventoryError, "삭제할 수 없습니다", msg=item):
+                inv.delete_item(self.conn, item, "d%d" % item)
+        self.assertEqual(len(inv.list_items(self.conn)), 4)
+        self.assertEqual(self.count("item_deletions"), 0)  # 거부된 삭제는 흔적도 남기지 않는다
+
+    def test_deleted_id_is_never_reused(self):
+        """8차 #1: 삭제 뒤 같은 번호를 받은 새 품목에 삭제 전 품목을 가리키던 오래된 요청이 적용되던 문제."""
+        old = inv.add_item(self.conn, "오타", "개")
+        inv.delete_item(self.conn, old, "delete-1")
+        new = inv.add_item(self.conn, "새품목", "개", opening=5)
+        self.assertGreater(new, old)
+        for stale in (lambda: inv.record_out(self.conn, old, 1, "use", "old-use"),
+                      lambda: inv.record_out(self.conn, old, 1, "waste", "old-waste"),
+                      lambda: inv.stocktake(self.conn, old, 0, "old-count"),
+                      lambda: inv.create_po(self.conn, old, 5, "old-po")):
+            with self.assertRaisesRegex(inv.InventoryError, "찾을 수 없"):
+                stale()
+        self.assertEqual(inv.current_stock(self.conn, new), 5)
+        self.assertEqual(inv.list_pos(self.conn), [])
+
+    def test_ids_stay_monotonic_after_deleting_the_newest(self):
+        a = inv.add_item(self.conn, "a", "개")
+        b = inv.add_item(self.conn, "b", "개")
+        inv.delete_item(self.conn, b, "d")
+        self.assertEqual(inv.add_item(self.conn, "c", "개"), b + 1)
+        inv.delete_item(self.conn, a, "d2")  # 앞쪽 번호를 지워도 마찬가지
+        self.assertEqual(inv.add_item(self.conn, "d", "개"), b + 2)
+
+    def test_delete_replay_by_key(self):
+        a = inv.add_item(self.conn, "오타", "개")
+        inv.delete_item(self.conn, a, "d1")
+        self.assertEqual(inv.delete_item(self.conn, a, "d1"), a)  # 더블클릭·재전송
+        other = inv.add_item(self.conn, "다른", "개")
+        with self.assertRaises(inv.InventoryError):
+            inv.delete_item(self.conn, other, "d1")  # 같은 키, 다른 품목
+        self.assertEqual([i["name"] for i in inv.list_items(self.conn)], ["다른"])
+
+    def test_add_replay_after_delete_does_not_resurrect(self):
+        """8차 #2: 삭제된 품목의 최초 추가 요청이 재전송되면 품목이 되살아나던 문제."""
+        old = inv.add_item(self.conn, "오타", "개", key="add-1")
+        inv.delete_item(self.conn, old, "delete-1")
+        self.assertEqual(inv.add_item(self.conn, "오타", "개", key="add-1"), old)
+        self.assertEqual(inv.list_items(self.conn), [])
+        with self.assertRaisesRegex(inv.InventoryError, "다른 품목"):
+            inv.add_item(self.conn, "다른이름", "개", key="add-1")  # 같은 키·다른 내용은 거부
+        self.assertEqual(inv.list_items(self.conn), [])
+        # 키 없이(새 요청으로) 같은 이름을 다시 만드는 것은 허용된다
+        again = inv.add_item(self.conn, "오타", "개", key="add-2")
+        self.assertNotEqual(again, old)
+        self.assertEqual([i["name"] for i in inv.list_items(self.conn)], ["오타"])
+
+    def test_bad_input(self):
+        a = inv.add_item(self.conn, "오타", "개")
+        for args in ((999, "k"), (True, "k"), (a, ""), (a, None), (a, 5)):
+            with self.assertRaises(inv.InventoryError, msg=args):
+                inv.delete_item(self.conn, *args)
+        with self.assertRaises(inv.InventoryError):
+            inv.delete_item(self.conn, a, "k", actor=3)
+        self.assertEqual(len(inv.list_items(self.conn)), 1)
+
+
+class Seed(unittest.TestCase):
+    """9차: 샘플 품목을 모두 삭제한 뒤 서버를 다시 켜면 샘플이 되살아나던 문제."""
+
+    def setUp(self):
+        import server
+        self.server = server
+        self.db = os.path.join(tempfile.mkdtemp(), "seed.db")
+        patcher = mock.patch.object(server, "DB", self.db)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def names(self):
+        c = inv.connect(self.db)
+        try:
+            return [i["name"] for i in inv.list_items(c)]
+        finally:
+            c.close()
+
+    def test_deleted_samples_stay_deleted(self):
+        self.server.seed()
+        self.assertEqual(len(self.names()), 5)
+        c = inv.connect(self.db)
+        for n, i in enumerate(inv.list_items(c)):
+            inv.delete_item(c, i["id"], "d%d" % n)
+        c.close()
+        self.server.seed()  # 서버 재시작
+        self.assertEqual(self.names(), [])
+
+    def test_seed_is_idempotent(self):
+        self.server.seed()
+        self.server.seed()
+        self.assertEqual(len(self.names()), 5)
+
+    def test_failure_midway_leaves_nothing_and_retry_gives_exactly_five(self):
+        """10차 #1: 두 번째 샘플에서 실패하면 불완전한 구성이 표시와 함께 확정되던 문제."""
+        real = inv._add_item_locked
+        calls = []
+
+        def flaky(*args, **kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("두 번째 삽입 실패")
+            return real(*args, **kw)
+        with mock.patch.object(inv, "_add_item_locked", flaky):
+            with self.assertRaises(RuntimeError):
+                self.server.seed()
+        c = inv.connect(self.db)
+        self.assertEqual(inv.list_items(c), [])  # 첫 번째 품목도 남지 않는다
+        self.assertIsNone(c.execute("SELECT 1 FROM meta WHERE key='seeded'").fetchone())
+        self.assertFalse(c.in_transaction)
+        c.close()
+        self.server.seed()  # 다시 시작하면 정확히 5개
+        self.assertEqual(len(self.names()), 5)
+
+    def test_concurrent_first_start(self):
+        """10차 #2: 동시에 처음 시작한 서버 중 하나가 이름 중복으로 실패하던 문제."""
+        errors = []
+        barrier = threading.Barrier(4)
+
+        def start():
+            try:
+                barrier.wait()
+                self.server.seed()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+        threads = [threading.Thread(target=start) for _ in range(4)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.names()), 5)
+        c = inv.connect(self.db)
+        self.assertEqual(c.execute("SELECT value FROM meta WHERE key='seeded'").fetchone()[0], "1")
+        c.close()
+
+    def test_existing_db_is_not_seeded(self):
+        """이 변경 전부터 쓰던 DB(meta 없음)에 품목이 있으면 샘플을 더하지 않는다. 삭제 기록만 있어도 마찬가지."""
+        c = inv.connect(self.db)
+        inv.add_item(c, "내 품목", "개")
+        c.close()
+        self.server.seed()
+        self.assertEqual(self.names(), ["내 품목"])
+        db2 = os.path.join(tempfile.mkdtemp(), "seed2.db")
+        c = inv.connect(db2)
+        i = inv.add_item(c, "오타", "개")
+        inv.delete_item(c, i, "d")
+        c.close()
+        with mock.patch.object(self.server, "DB", db2):
+            self.server.seed()
+        c = inv.connect(db2)
+        self.assertEqual(inv.list_items(c), [])
+        c.close()
+
+
 class Stores(unittest.TestCase):
     def setUp(self):
         self.conn = inv.connect()
@@ -325,6 +518,13 @@ class ServerRoutes(unittest.TestCase):
         self.assertEqual(self.call("/api/items/archive", {"item_id": sugar, "archived": "yes"})[0], 400)
         self.assertEqual([i["name"] for i in self.call("/api/items?archived=1&store=%d" % b["id"])[1]], ["설탕"])
         self.assertNotIn("설탕", [i["name"] for i in self.call("/api/items?store=%d" % b["id"])[1]])
+        typo = self.call("/api/items", {"store_id": b["id"], "name": "오타", "unit": "개", "key": "i3", "actor": "민수"})[1]["id"]
+        dele = {"item_id": typo, "key": "d1", "actor": "민수"}
+        self.assertEqual(self.call("/api/items/delete", dele)[0], 200)
+        self.assertEqual(self.call("/api/items/delete", dele)[0], 200)  # 더블클릭
+        self.assertEqual(self.call("/api/items/delete", {"item_id": typo, "key": "d2"})[0], 400)  # 이미 없는 품목
+        self.assertEqual(self.call("/api/items/delete", {"item_id": typo})[0], 400)  # 키 없음
+        self.assertNotIn("오타", [i["name"] for i in self.call("/api/items?store=%d" % b["id"])[1]])
         self.assertEqual(self.call("/api/stores/rename", {"store_id": b["id"], "name": "역삼점"})[0], 200)
         self.assertEqual(self.call("/api/stores/rename", {"store_id": b["id"], "name": "본점"})[0], 400)
         self.assertEqual(self.call("/api/shortage/ai?store=999", {})[0], 400)

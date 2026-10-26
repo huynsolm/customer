@@ -136,7 +136,7 @@ async function vStock(st) {
     <div class="scroll"><table>
     <tr><th>품목</th><th class="num">현재고</th><th class="num">발주 기준</th><th class="num">남은 일수</th><th class="num">권장 발주</th><th>사용·폐기 / 마감</th><th></th></tr>
     ${items.map(i => { const r = by[i.id]; return `<tr class="${r.short ? 'low' : ''}" data-id="${i.id}" data-key="${uid()}">
-      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''} <button data-a="edit">수정</button> <button data-a="archive">보관</button></td>
+      <td>${esc(i.name)} ${r.short ? '<span class="tag">부족</span>' : ''} <button data-a="edit">수정</button> <button data-a="archive">보관</button> <button data-a="delete">삭제</button></td>
       <td class="num">${i.stock} ${esc(i.unit)}${r.incoming ? `<br><span class="mut">+${r.incoming} 입고 예정</span>` : ''}</td><td class="num">${i.reorder_point}</td>
       <td class="num">${r.days_left ?? '-'}</td>
       <td class="num">${r.suggested_qty ? `${r.suggested_qty} <button data-a="order" data-q="${r.suggested_qty}">발주</button>` : '-'}</td>
@@ -146,10 +146,14 @@ async function vStock(st) {
         <button data-a="count">마감</button></td></tr>`; }).join('')}
   </table></div>
   ${archivedItems.length ? `<details><summary>보관된 품목 ${archivedItems.length}개</summary><ul id="archived">${archivedItems.map(i =>
-    `<li data-id="${i.id}">${esc(i.name)} <button data-a="restore">복원</button></li>`).join('')}</ul></details>` : ''}
+    `<li data-id="${i.id}">${esc(i.name)} <button data-a="restore">복원</button> <button data-a="delete">삭제</button></li>`).join('')}</ul></details>` : ''}
   <p class="mut">남은 일수·권장 발주는 최근 7일 사용량 기준(가정: 일주일분 + 발주 기준). 사용·폐기·마감은 모두 이력에 남고, 같은 버튼을 두 번 눌러도 한 번만 반영됩니다.</p>`;
   document.querySelectorAll('#archived li button').forEach(b => b.onclick = () => actIn(st, async () => {
-    await api('/api/items/archive', {item_id:+b.closest('li').dataset.id, archived:false, actor:actor()});
+    const id = +b.closest('li').dataset.id, who = actor();
+    if (b.dataset.a === 'delete') {
+      if (!confirm('이 품목을 완전히 삭제할까요? 되돌릴 수 없습니다. 기록이 있는 품목은 삭제되지 않습니다.')) return;
+      await send('/api/items/delete', {item_id:id});
+    } else await api('/api/items/archive', {item_id:id, archived:false, actor:who});
   }));
   $('#nadd').onclick = () => actIn(st, async () => {
     await send('/api/items', {store_id:st, name:$('#nn').value.trim(), unit:$('#nu').value.trim(),
@@ -182,6 +186,10 @@ async function vStock(st) {
       const who = actor();
       if (!confirm('이 품목을 보관할까요? 이력은 남고, 목록·부족 계산에서 빠집니다. 재고가 0이어야 합니다.')) return;
       await api('/api/items/archive', {item_id:id, archived:true, actor:who});
+    } else if (b.dataset.a === 'delete') {
+      const who = actor();
+      if (!confirm('이 품목을 완전히 삭제할까요? 되돌릴 수 없습니다. 입고·사용·발주 등 기록이 있는 품목은 삭제되지 않으며(보관을 쓰세요), 실수로 만든 품목에만 씁니다.')) return;
+      await send('/api/items/delete', {item_id:id});
     } else if (b.dataset.a === 'order') await send('/api/pos', {item_id:id, qty:+b.dataset.q});
     else if (b.dataset.a === 'count') await send('/api/stocktake', {item_id:id, counted:intOf($('.c', tr).value, 0, '실사 수량')});
     else await send('/api/out', {item_id:id, qty:intOf($('.q', tr).value, 1, '수량'), kind:b.dataset.a});
